@@ -18,6 +18,7 @@ uint32_t warmup_start=0, calibration_start=0;
 float gyro_sum[3]={}, acc_sum[3]={};
 ImuCalibrationNoise calibration_noise;
 bool aligned=false;
+float aligned_pitch_direction=c::IMU_PITCH_DIRECTION;
 float yaw_origin=0.0f, pitch_origin=0.0f, yaw_reference=0.0f, pitch_reference=0.0f;
 constexpr float rad_per_deg=0.0174532925199f;
 
@@ -141,6 +142,7 @@ State read() {
   State result=latest;
   const bool referenced=aligned;
   const float yo=yaw_origin, po=pitch_origin, yr=yaw_reference, pr=pitch_reference;
+  const float pitch_direction=aligned_pitch_direction;
   taskEXIT_CRITICAL();
   result.ready=result.phase==Phase::Ready &&
     xTaskGetTickCount()-result.stamp_ms<=c::IMU_MAX_GAP_MS;
@@ -148,18 +150,24 @@ State read() {
   result.valid=result.ready && referenced;
   if (referenced) {
     result.yaw_rad=yr+c::IMU_YAW_DIRECTION*(result.raw_yaw_rad-yo);
-    result.pitch_rad=pr+c::IMU_PITCH_DIRECTION*(result.raw_pitch_rad-po);
+    result.pitch_rad=pr+pitch_direction*(result.raw_pitch_rad-po);
   }
   return result;
 }
 bool ready() {return read().ready;}
 bool capture_reference(float yaw_rad,float pitch_rad) {
+  return capture_reference(yaw_rad,pitch_rad,c::IMU_PITCH_DIRECTION);
+}
+bool capture_reference(float yaw_rad,float pitch_rad,float pitch_direction) {
+  if ((pitch_direction!=1.0f && pitch_direction!=-1.0f) ||
+      !std::isfinite(yaw_rad) || !std::isfinite(pitch_rad)) return false;
   taskENTER_CRITICAL();
   const bool ok=latest.ready && latest.phase==Phase::Ready &&
     xTaskGetTickCount()-latest.stamp_ms<=c::IMU_MAX_GAP_MS;
   if (ok) {
     yaw_origin=latest.raw_yaw_rad; pitch_origin=latest.raw_pitch_rad;
     yaw_reference=yaw_rad; pitch_reference=pitch_rad;
+    aligned_pitch_direction=pitch_direction;
     aligned=true;
   }
   taskEXIT_CRITICAL();

@@ -8,6 +8,7 @@
 #include "gimbal_imu.hpp"
 #include "motor/rm_motor/rm_motor.hpp"
 #include "task.h"
+#include "trajectory_follow.hpp"
 
 extern "C" void buzzer_signal_homing_done();
 
@@ -25,6 +26,10 @@ bool finished = false;
 uint32_t pitch_stamp = 0, m_stamp = 0, pitch_rx = 0, m_rx = 0, tx_errors = 0;
 float pitch_request = 0.0f, m_request = 0.0f;
 uint32_t command_stamp = 0, last_tx = 0;
+bool follow_pitch_claimed = false;
+float follow_pitch_torque = 0.0f;
+uint32_t follow_pitch_stamp = 0, last_m_tx = 0;
+bool m_sent_once = false;
 bool sent_once = false, start_requested = c::PITCH_START_ENABLED, stop_requested = false;
 float clamp(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 struct PI
@@ -41,8 +46,8 @@ struct PI
   }
 };
 // Physical mechanism travel is measured by the IMU attached to the moving arm.
-// One M2006-driven 35-degree lift, then persistent endpoint hold. No second lift.
-constexpr float PITCH_START_BODY_TRAVEL_RAD = 0.75f;
+// One M2006-driven lift to the selected IMU travel, then persistent endpoint hold.
+constexpr float PITCH_START_BODY_TRAVEL_RAD = 1.2f;
 constexpr uint32_t PITCH_START_IMU_READY_TIMEOUT_MS = 20000U;
 constexpr float PITCH_START_MIN_IMU_SEEK_RAD = 0.01745329252f;  // 1 degree to learn direction.
 
@@ -50,10 +55,13 @@ constexpr float PITCH_START_MIN_IMU_SEEK_RAD = 0.01745329252f;  // 1 degree to l
 // Manufacturer continuous torque is 1 Nm; do not use the driver's electrical
 // saturation (1.8 Nm in its conversion) as a continuous holding specification.
 constexpr float END_HOLD_MAX_TORQUE_NM = 1.0f;
-constexpr float END_HOLD_KP = 60.0f;   // Nm/rad: displacement resistance.
-constexpr float END_HOLD_KI = 120.0f;  // Nm/(rad*s): learns the gravity load.
-constexpr float END_HOLD_KD = 0.4f;    // Nm/(rad/s): motion damping.
+constexpr float END_HOLD_KP = 60.0f;  // Nm/rad: displacement resistance.
+constexpr float END_HOLD_KI = 15.0f;  // Nm/(rad*s): slow load learning avoids stiction hunting.
+constexpr float END_HOLD_KD = 0.4f;   // Nm/(rad/s): motion damping.
 constexpr float END_HOLD_SPEED_FILTER_S = 0.002f;
+// MOTOR OUTPUT-SHAFT tolerance, not the IMU body angle (~0.086 degree).
+constexpr float END_HOLD_POSITION_TOL_RAD = 0.0015f;
+constexpr float END_HOLD_INTEGRATE_MAX_SPEED_RAD_S = 0.05f;
 static_assert(
   END_HOLD_MAX_TORQUE_NM <= sp::M2006_P36_MAX_TORQUE,
   "Endpoint current command exceeds the motor driver's limit");
@@ -63,17 +71,27 @@ struct EndpointHold
   float integral = 0.0f, filtered_speed = 0.0f;
   bool initialized = false;
 
-  float step(float error, float speed, float feedback_torque, float dt)
+  float step(float error, float speed, float dt)
   {
     if (!initialized) {
-      // Seed once from measured current torque; never feed it back continuously.
-      integral = clamp(feedback_torque, -END_HOLD_MAX_TORQUE_NM, END_HOLD_MAX_TORQUE_NM);
+      // Motion current is not a gravity measurement. At a passively balanced
+      // endpoint, inheriting it as I torque pushes the mechanism away at zero error.
+      integral = 0.0f;
       filtered_speed = speed;
       initialized = true;
     }
     filtered_speed += dt / (END_HOLD_SPEED_FILTER_S + dt) * (speed - filtered_speed);
-    const float base = END_HOLD_KP * error - END_HOLD_KD * filtered_speed;
-    const float increment = END_HOLD_KI * error * dt;
+    // Continuous dead zone: no P jump at the tolerance boundary. Outside it,
+    // position resistance and the full 1Nm authority remain available.
+    const float position_error =
+      error > END_HOLD_POSITION_TOL_RAD
+        ? error - END_HOLD_POSITION_TOL_RAD
+        : (error < -END_HOLD_POSITION_TOL_RAD ? error + END_HOLD_POSITION_TOL_RAD : 0.0f);
+    const float base = END_HOLD_KP * position_error - END_HOLD_KD * filtered_speed;
+    // Do not chase capture transients/backlash with I. Freeze (never erase) the
+    // learned load torque inside the tolerance or while moving appreciably.
+    const bool integrate = std::fabs(filtered_speed) <= END_HOLD_INTEGRATE_MAX_SPEED_RAD_S;
+    const float increment = integrate ? END_HOLD_KI * position_error * dt : 0.0f;
     const float candidate =
       clamp(integral + increment, -END_HOLD_MAX_TORQUE_NM, END_HOLD_MAX_TORQUE_NM);
     const float raw = base + candidate;
@@ -81,7 +99,8 @@ struct EndpointHold
     if (!((raw > END_HOLD_MAX_TORQUE_NM && increment > 0.0f) ||
           (raw < -END_HOLD_MAX_TORQUE_NM && increment < 0.0f)))
       integral = candidate;
-    // At zero error the learned gravity torque remains, rather than dropping to zero.
+    // A balanced stationary endpoint needs no artificial torque. If gravity
+    // requires a load torque, retain the I term learned after a real deviation.
     return clamp(base + integral, -END_HOLD_MAX_TORQUE_NM, END_HOLD_MAX_TORQUE_NM);
   }
 };
@@ -92,6 +111,7 @@ struct Feedback
   bool fresh;
   float body_pitch_rad;
   bool imu_fresh;
+  bool external_pitch_control;
 };
 struct Controller
 {
@@ -151,18 +171,24 @@ struct Controller
     out.m2006_zero_rad = m2006_hold_angle;
     out.pitch_zero_rad = endpoint_pitch_angle;
     out.m2006_locked = true;
-    out.m2006_torque_nm = endpoint_hold.step(m2006_hold_angle - f.ma, f.ms, f.mt, dt);
+    out.m2006_torque_nm = endpoint_hold.step(m2006_hold_angle - f.ma, f.ms, dt);
 
-    // Keep the existing GM6020 phase-B holding method/limits at the final pose.
-    // Releasing it in Done changed the linked mechanism's gravity load abruptly.
-    const float pitch_error = endpoint_pitch_angle - f.pa;
-    const float want = clamp(
-      c::HOME_PITCH_PHASEB_STIFF_NM_PER_RAD * pitch_error -
-        c::HOME_PITCH_PHASEB_DAMP_NM_PER_RAD_S * f.ps,
-      -c::HOME_PITCH_PHASEB_MAX_TORQUE_NM, c::HOME_PITCH_PHASEB_MAX_TORQUE_NM);
-    const float max_step = 3.0f * dt;
-    phaseb_torque += clamp(want - phaseb_torque, -max_step, max_step);
-    out.pitch_torque_nm = phaseb_torque;
+    // Once the IMU follower owns pitch, the previous lower-stop hold is released.
+    // M2006 above keeps its independently captured shaft position throughout.
+    if (f.external_pitch_control) {
+      phaseb_torque = 0.0f;
+      out.pitch_torque_nm = 0.0f;
+    }
+    else {
+      const float pitch_error = endpoint_pitch_angle - f.pa;
+      const float want = clamp(
+        c::HOME_PITCH_PHASEB_STIFF_NM_PER_RAD * pitch_error -
+          c::HOME_PITCH_PHASEB_DAMP_NM_PER_RAD_S * f.ps,
+        -c::HOME_PITCH_PHASEB_MAX_TORQUE_NM, c::HOME_PITCH_PHASEB_MAX_TORQUE_NM);
+      const float max_step = 3.0f * dt;
+      phaseb_torque += clamp(want - phaseb_torque, -max_step, max_step);
+      out.pitch_torque_nm = phaseb_torque;
+    }
 
     // Preserve the previous 5s completion indication, with NO output/target reset.
     if (now - m2006_hold_since >= 5000U) {
@@ -297,7 +323,8 @@ struct Controller
             fault(Fault::Config);
             return;
           }
-          imu_return_direction = body_seek > 0.0f ? -1.0f : 1.0f;
+          out.pitch_up_imu_direction = body_seek > 0.0f ? 1.0f : -1.0f;
+          imu_return_direction = -out.pitch_up_imu_direction;
           imu_return_origin = f.body_pitch_rad;  // Seated rear stop is physical travel zero.
           out.pitch_torque_nm = 0.0f;
           pitch_pi = {};
@@ -320,7 +347,7 @@ struct Controller
       out.pitch_return_relative_rad = body_travel;
       out.pitch_return_target_relative_rad = PITCH_START_BODY_TRAVEL_RAD;
       if (body_travel >= PITCH_START_BODY_TRAVEL_RAD) {
-        // Lock on this tick at 35deg from the seated rear-stop IMU pose.
+        // Lock on this tick at the selected travel from the seated rear-stop IMU pose.
         // There is no intermediate handoff or additional second-stage travel.
         m2006_hold_locked = true;
         m2006_hold_since = now;
@@ -330,7 +357,7 @@ struct Controller
       }
       // Preserve the existing M2006 breakaway/cruise drive and its direction.
       // GM6020 stays released throughout the single lift; M2006 drives it all.
-      // Both encoder hold targets are captured only at the 35deg endpoint.
+      // Both encoder hold targets are captured only at the selected endpoint.
       const float dir = -c::HOME_PITCH_DIRECTION;
       const float tq = (std::fabs(f.ms) < c::HOME_M2006_BREAKAWAY_SPEED_RAD_S)
                          ? c::HOME_M2006_BREAKAWAY_TORQUE_NM
@@ -372,12 +399,16 @@ void start()
   taskENTER_CRITICAL();
   start_requested = true;
   stop_requested = false;
+  follow_pitch_claimed = false;
+  follow_pitch_torque = 0.0f;
   taskEXIT_CRITICAL();
 }
 void cancel()
 {
   taskENTER_CRITICAL();
   finished = false;
+  follow_pitch_claimed = false;
+  follow_pitch_torque = 0.0f;
   stop_requested = true;
   start_requested = false;
   pitch_request = m_request = 0.0f;
@@ -392,6 +423,22 @@ Status snapshot()
   s.tx_errors = tx_errors;
   taskEXIT_CRITICAL();
   return s;
+}
+bool submit_pitch_follow_torque(float torque_nm, uint32_t now_ms)
+{
+  if (!c::FOLLOW_PITCH_SEQUENCE_ENABLED || !selected() || !std::isfinite(torque_nm)) return false;
+  taskENTER_CRITICAL();
+  const bool ready = latest.stage == Stage::Done && latest.homed && latest.m2006_locked &&
+                     latest.feedback_fresh && latest.fault == Fault::None && !stop_requested &&
+                     now_ms - latest.stamp_ms < c::HOME_COMMAND_TIMEOUT_MS;
+  if (ready) {
+    follow_pitch_torque =
+      clamp(torque_nm, -c::FOLLOW_PITCH_MAX_TORQUE_NM, c::FOLLOW_PITCH_MAX_TORQUE_NM);
+    follow_pitch_stamp = now_ms;
+    follow_pitch_claimed = true;
+  }
+  taskEXIT_CRITICAL();
+  return ready;
 }
 bool receive_can1(const CAN_RxHeaderTypeDef & h, uint8_t * data, uint32_t now)
 {
@@ -413,22 +460,35 @@ bool receive_can1(const CAN_RxHeaderTypeDef & h, uint8_t * data, uint32_t now)
 }
 void transmit_can1(uint32_t now)
 {
-  if (!selected() || (sent_once && now - last_tx < c::HOME_CAN_INTERVAL_MS)) return;
+  if (!selected()) return;
   taskENTER_CRITICAL();
+  const bool fast_pitch = c::FOLLOW_PITCH_SEQUENCE_ENABLED && follow_pitch_claimed;
   const bool live = now - command_stamp < c::HOME_COMMAND_TIMEOUT_MS && !stop_requested;
   const float pt = live ? pitch_request : 0.0f, mt = live ? m_request : 0.0f;
   taskEXIT_CRITICAL();
-  uint8_t pd[8] = {}, md[8] = {};  // One owner for both groups; yaw and other slots stay zero.
-  pitch.cmd(pt);
-  pitch.write(pd);
-  m2006.cmd(mt);
-  m2006.write(md);
-  // Independent submissions: a busy group is retried on the next interval.
-  submit(pitch.tx_id, pd);
-  submit(m2006.tx_id, md);
-  last_tx = now;
-  sent_once = true;
+  const uint32_t pitch_period = fast_pitch ? c::FOLLOW_CAN_TX_INTERVAL_MS : c::HOME_CAN_INTERVAL_MS;
+  // Exactly one owner of 0x1FE, with all yaw slots zero in this pitch-only mode.
+  if (!sent_once || now - last_tx >= pitch_period) {
+    uint8_t data[8] = {};
+    pitch.cmd(pt);
+    pitch.write(data);
+    if (submit(pitch.tx_id, data)) {
+      last_tx = now;
+      sent_once = true;
+    }
+  }
+  // Keep the proven M2006 5ms holding cadence; faster pitch does not flood this group.
+  if (!m_sent_once || now - last_m_tx >= c::HOME_CAN_INTERVAL_MS) {
+    uint8_t data[8] = {};
+    m2006.cmd(mt);
+    m2006.write(data);
+    if (submit(m2006.tx_id, data)) {
+      last_m_tx = now;
+      m_sent_once = true;
+    }
+  }
 }
+
 void run()
 {
   Controller ctrl;
@@ -454,7 +514,11 @@ void run()
       pitch.is_open() && m2006.is_open() && now - pitch_stamp < c::HOME_FEEDBACK_TIMEOUT_MS &&
         now - m_stamp < c::HOME_FEEDBACK_TIMEOUT_MS,
       imu.raw_pitch_rad,
-      imu.ready};
+      imu.ready,
+      c::FOLLOW_PITCH_SEQUENCE_ENABLED && follow_pitch_claimed};
+    const bool external_pitch = c::FOLLOW_PITCH_SEQUENCE_ENABLED && follow_pitch_claimed;
+    const bool external_fresh = now - follow_pitch_stamp < c::FOLLOW_COMMAND_TIMEOUT_MS;
+    const float external_torque = follow_pitch_torque;
     const bool go = start_requested, stop = stop_requested;
     start_requested = false;
     stop_requested = false;
@@ -464,6 +528,8 @@ void run()
     else if (go)
       ctrl.begin(now);
     ctrl.step(f, now, elapsed * 0.001f);
+    if (external_pitch && ctrl.out.stage == Stage::Done && ctrl.out.fault == Fault::None)
+      ctrl.out.pitch_torque_nm = external_fresh ? external_torque : 0.0f;
     const bool completed = ctrl.out.homed && ctrl.m2006_home_done;
     taskENTER_CRITICAL();
     latest = ctrl.out;

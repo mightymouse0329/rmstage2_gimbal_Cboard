@@ -5,6 +5,8 @@
 #include "gimbal_imu.hpp"
 
 #include <cmath>
+#include <cstring>
+#include <limits>
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -141,7 +143,7 @@ float pid(
 // 单轴：位置环 → 目标转速限幅 → 斜坡 → 速度环（含力矩前馈）→ 力矩限幅
 AxisResult update_axis(
   AxisState & state, const FollowAxisConfig & c, const AxisFeedback & f, float ref_angle,
-  float ref_rate, float ref_acc, float dt)
+  float ref_rate, float ref_acc, float dt, bool physical_bounds = false)
 {
   AxisResult r = {};
   r.target_angle_rad = ref_angle;
@@ -150,7 +152,7 @@ AxisResult update_axis(
   r.actual_angle_rad = f.angle_rad;
   r.actual_speed_rad_s = f.speed_rad_s;
 
-  const bool bounded = control_constants::FOLLOW_ENFORCE_ANGLE_LIMITS;
+  const bool bounded = physical_bounds || control_constants::FOLLOW_ENFORCE_ANGLE_LIMITS;
   const float target =
     bounded ? clamp(ref_angle, c.angle_min_rad, c.angle_max_rad) : ref_angle;
   r.limited_angle_rad = target;
@@ -428,6 +430,329 @@ void transmit_can1(uint32_t now_ms, bool permitted)
   }
 }
 
+constexpr TrajectoryPoint stretched_reference(TrajectoryPoint point, float pitch_gain, uint32_t stretch)
+{
+  const float time2 = static_cast<float>(stretch) * stretch;
+  return {point.yaw, point.yaw_vel / stretch, point.yaw_acc / time2,
+          point.pitch * pitch_gain, point.pitch_vel * pitch_gain / stretch,
+          point.pitch_acc * pitch_gain / time2};
+}
+
+constexpr TrajectoryPoint prelift_reference(TrajectoryPoint point, float u, float seconds, float travel)
+{
+  const float u2 = u*u, u3 = u2*u, u4 = u3*u, u5 = u4*u;
+  point.pitch = point.pitch - travel + travel * (10.0f*u3 - 15.0f*u4 + 6.0f*u5);
+  point.pitch_vel = travel * 30.0f*u2*(1.0f-u)*(1.0f-u) / seconds;
+  point.pitch_acc = travel * (60.0f*u - 180.0f*u2 + 120.0f*u3) / (seconds*seconds);
+  return point;
+}
+
+TrajectoryPoint sample_reference(uint32_t elapsed_ms)
+{
+  constexpr uint32_t stretch = control_constants::FOLLOW_TRAJECTORY_TIME_SCALE;
+  TrajectoryPoint point = trajectory_sample_at_ms((elapsed_ms / stretch) % TRAJECTORY_PERIOD_MS);
+  // Undo configured amplitude scaling HERE, never edit the reference data/generator.
+  const float pitch_gain = control_constants::FOLLOW_PITCH_SEQUENCE_ENABLED ?
+    60.0f / TRAJECTORY_PITCH_RANGE_DEG : 1.0f;
+  return stretched_reference(point, pitch_gain, stretch);
+}
+
+struct PitchBoundaryResult {
+  float torque;
+  bool lower_braking;
+  bool upper_braking;
+};
+
+// Measured speed determines braking, not the planned direction. The latency
+// term includes IMU filtering/CAN response. This is a software braking envelope,
+// not a claim that unknown mechanics can always stop at the assumed deceleration.
+constexpr PitchBoundaryResult pitch_boundary_torque(
+  float angle, float speed, float torque, float lower, float upper)
+{
+  namespace c = control_constants;
+  const float magnitude = speed < 0.0f ? -speed : speed;
+  const float stopping = magnitude * magnitude / (2.0f * c::FOLLOW_PITCH_BRAKE_DECEL_RAD_S2) +
+    magnitude * c::FOLLOW_PITCH_BRAKE_LATENCY_S;
+  const bool down = speed < 0.0f && angle - lower <= stopping;
+  const bool up = speed > 0.0f && upper - angle <= stopping;
+  const float raw_brake = c::FOLLOW_PITCH_BRAKE_GAIN_NM_PER_RAD_S * magnitude;
+  const float brake = raw_brake < c::FOLLOW_PITCH_MAX_TORQUE_NM ?
+    raw_brake : c::FOLLOW_PITCH_MAX_TORQUE_NM;
+  if (down && torque < brake) torque = brake;
+  if (up && torque > -brake) torque = -brake;
+  if (angle <= lower && torque < 0.0f) torque = 0.0f;
+  if (angle >= upper && torque > 0.0f) torque = 0.0f;
+  return {torque, down, up};
+}
+
+constexpr bool pitch_support_fault(uint8_t fault)
+{
+  return fault == FAULT_TRACKING_ERROR || fault == FAULT_OVERSPEED ||
+    fault == FAULT_PRELIFT || fault == FAULT_BOUNDARY;
+}
+
+// Optional sequence uses the existing follow task and PID structure. The tested
+// pitch_start task remains the only CAN writer and keeps M2006 position holding.
+void run_pitch_sequence()
+{
+  namespace c = control_constants;
+  static Result result;  // Keep the existing 256-word task stack; no large reset temporary.
+  static FollowAxisConfig pitch_config = c::FOLLOW_PITCH;
+  static FollowAxisConfig hold_config = c::FOLLOW_PITCH;
+  const TrajectoryPoint initial = sample_reference(0);
+  const float physical_lower = initial.pitch - c::FOLLOW_PITCH_PRELIFT_RAD +
+    c::FOLLOW_PITCH_LOWER_MARGIN_RAD;
+  const float tracking_lower = initial.pitch - c::FOLLOW_PITCH_TRACK_FLOOR_TOL_RAD;
+  pitch_config.angle_min_rad = initial.pitch - c::FOLLOW_PITCH_PRELIFT_RAD +
+    c::FOLLOW_PITCH_LOWER_MARGIN_RAD;
+  pitch_config.angle_max_rad = initial.pitch - c::FOLLOW_PITCH_PRELIFT_RAD +
+    c::FOLLOW_PITCH_USABLE_TRAVEL_RAD - c::FOLLOW_PITCH_UPPER_MARGIN_RAD;
+  pitch_config.max_speed_rad_s = c::FOLLOW_PITCH_TEST_MAX_SPEED_RAD_S;
+  pitch_config.max_accel_rad_s2 = c::FOLLOW_PITCH_TEST_MAX_ACCEL_RAD_S2;
+  hold_config = pitch_config;
+  hold_config.angle_pid = {c::FOLLOW_PITCH_FAULT_HOLD_KP, 0.0f, 0.0f, 0.0f};
+  hold_config.max_speed_rad_s = c::FOLLOW_PITCH_FAULT_HOLD_MAX_SPEED_RAD_S;
+  hold_config.accel_feedforward_j = 0.0f;
+  hold_config.friction_nm = 0.0f;
+  const bool config_ok = configured(pitch_config) &&
+    pitch_config.angle_min_rad < initial.pitch &&
+    pitch_config.angle_max_rad > -initial.pitch;
+  PitchSequencePhase phase = PitchSequencePhase::Waiting;
+  uint8_t failure = config_ok ? FAULT_NONE : FAULT_CONFIG;
+  uint32_t prelift_start = 0, trajectory_start = 0, settle_since = 0, error_ms = 0;
+  uint32_t speed_stamp = 0;
+  float previous_raw_pitch = 0.0f, filtered_raw_speed = 0.0f, up_sign = 1.0f;
+  bool have_speed = false;
+  bool reference_started = false, fault_hold_captured = false;
+  float fault_hold_target = 0.0f;
+  TickType_t wake = xTaskGetTickCount(), previous = wake;
+  constexpr uint32_t period = TRAJECTORY_PERIOD_MS * c::FOLLOW_TRAJECTORY_TIME_SCALE;
+  const float missing = std::numeric_limits<float>::quiet_NaN();
+
+  for (;;) {
+    vTaskDelayUntil(&wake, pdMS_TO_TICKS(c::FOLLOW_PERIOD_MS));
+    const uint32_t now = xTaskGetTickCount();
+    const uint32_t elapsed = now - previous;
+    if (!elapsed) continue;
+    previous = now;
+    const float dt = elapsed * 0.001f;
+    const auto prepared = pitch_start::snapshot();
+    auto imu = gimbal_imu::read();
+    std::memset(&result, 0, sizeof(result));
+    result.pitch_only = true;
+    result.stamp_ms = now;
+    result.pitch.target_angle_rad = initial.pitch;
+    if (reference_started) {
+      result.trajectory_elapsed_ms = (now - trajectory_start) % period;
+      result.pitch.target_angle_rad = sample_reference(result.trajectory_elapsed_ms).pitch;
+    }
+    result.pitch.actual_angle_rad = imu.valid ? imu.pitch_rad : missing;
+    result.yaw.actual_angle_rad = imu.valid ? imu.yaw_rad : missing;
+    result.configuration_ready = config_ok;
+    result.calibrated = imu.valid && phase != PitchSequencePhase::Waiting;
+    result.feedback_fresh = imu.ready && prepared.feedback_fresh &&
+      now - prepared.stamp_ms < c::HOME_COMMAND_TIMEOUT_MS;
+    const bool rc_stop = c::FOLLOW_USE_RC_STOP && g_data.sw_r == 0;
+    result.rc_stop = rc_stop;
+
+    if (!config_ok) phase = PitchSequencePhase::Fault;
+    if (prepared.stage == pitch_start::Stage::Fault) {
+      failure = FAULT_FEEDBACK;
+      phase = PitchSequencePhase::Fault;
+    }
+    if (phase == PitchSequencePhase::Waiting && prepared.stage == pitch_start::Stage::Done &&
+        prepared.homed && prepared.m2006_locked && result.feedback_fresh) {
+      up_sign = prepared.pitch_up_imu_direction;
+      if ((up_sign != 1.0f && up_sign != -1.0f) ||
+          !gimbal_imu::capture_reference(initial.yaw,
+            initial.pitch - c::FOLLOW_PITCH_PRELIFT_RAD, up_sign)) {
+        failure = FAULT_IMU;
+        phase = PitchSequencePhase::Fault;
+      } else {
+        imu = gimbal_imu::read();
+        previous_raw_pitch = imu.raw_pitch_rad;
+        speed_stamp = imu.stamp_ms;
+        filtered_raw_speed = 0.0f;
+        have_speed = true;
+        prelift_start = now;
+        phase = PitchSequencePhase::Prelift;
+        reset_axis(pitch_state);
+        set_enabled(true);
+      }
+    }
+
+    if (phase == PitchSequencePhase::Prelift || phase == PitchSequencePhase::Tracking) {
+      if (!imu.valid || !std::isfinite(imu.pitch_rad) || !std::isfinite(imu.raw_pitch_rad)) {
+        failure = FAULT_IMU;
+        phase = PitchSequencePhase::Fault;
+      } else if (!result.feedback_fresh || !prepared.homed || !prepared.m2006_locked) {
+        failure = FAULT_FEEDBACK;
+        phase = PitchSequencePhase::Fault;
+      } else if (elapsed > c::FOLLOW_MAX_STEP_MS) {
+        failure = FAULT_TIMING;
+        phase = PitchSequencePhase::Fault;
+      } else if (!enabled || rc_stop) {
+        failure = FAULT_NONE;
+        phase = PitchSequencePhase::Fault;  // Latched stop; no automatic restart.
+      }
+    }
+
+    // Speed is also from the IMU, never the GM6020 encoder/RPM feedback. Update
+    // only at a NEW sensor timestamp, using that sample's actual interval.
+    if (imu.ready && (!have_speed || imu.stamp_ms != speed_stamp)) {
+      const uint32_t sensor_ms = imu.stamp_ms - speed_stamp;
+      if (have_speed && sensor_ms > 0U && sensor_ms <= c::IMU_MAX_GAP_MS) {
+        const float sensor_dt = sensor_ms * 0.001f;
+        const float measured = (imu.raw_pitch_rad - previous_raw_pitch) / sensor_dt;
+        filtered_raw_speed += sensor_dt / (c::FOLLOW_IMU_SPEED_FILTER_S + sensor_dt) *
+          (measured - filtered_raw_speed);
+      } else {
+        filtered_raw_speed = 0.0f;
+      }
+      previous_raw_pitch = imu.raw_pitch_rad;
+      speed_stamp = imu.stamp_ms;
+      have_speed = true;
+    }
+    const float speed = up_sign * filtered_raw_speed;
+    if ((phase == PitchSequencePhase::Prelift || phase == PitchSequencePhase::Tracking) &&
+        std::fabs(speed) > pitch_config.max_speed_rad_s * c::FOLLOW_OVERSPEED_FACTOR) {
+      failure = FAULT_OVERSPEED;
+      phase = PitchSequencePhase::Fault;
+    }
+
+    if (phase == PitchSequencePhase::Prelift || phase == PitchSequencePhase::Tracking) {
+      TrajectoryPoint target = initial;
+      if (phase == PitchSequencePhase::Prelift) {
+        const float seconds = c::FOLLOW_PITCH_PRELIFT_TIME_MS * 0.001f;
+        const float u = clamp((now - prelift_start) * 0.001f / seconds, 0.0f, 1.0f);
+        target = prelift_reference(initial, u, seconds, c::FOLLOW_PITCH_PRELIFT_RAD);
+        const bool settled = u >= 1.0f &&
+          std::fabs(imu.pitch_rad - initial.pitch) <= c::FOLLOW_PITCH_PRELIFT_TOL_RAD &&
+          std::fabs(speed) <= c::FOLLOW_PITCH_PRELIFT_QUIET_RAD_S;
+        if (!settled) settle_since = 0;
+        else if (!settle_since) settle_since = now;
+        if (settle_since && now - settle_since >= c::FOLLOW_PITCH_PRELIFT_SETTLE_MS) {
+          // Reference the actual settled start to raw trajectory point zero.
+          // Preserve the velocity-loop load integral through this transition.
+          if (!gimbal_imu::capture_reference(initial.yaw, initial.pitch, up_sign)) {
+            failure = FAULT_IMU;
+            phase = PitchSequencePhase::Fault;
+          } else {
+            imu = gimbal_imu::read();
+            pitch_state.angle = PidState{};
+            pitch_state.speed.previous_feedback = speed;
+            pitch_state.speed.filtered_derivative = 0.0f;
+            pitch_state.speed.initialized = true;
+            pitch_state.speed_command = 0.0f;
+            pitch_state.ff_direction = 0.0f;
+            trajectory_start = now;
+            reference_started = true;
+            error_ms = 0;
+            phase = PitchSequencePhase::Tracking;
+            target = initial;
+          }
+        } else if (now - prelift_start >= c::FOLLOW_PITCH_PRELIFT_TIMEOUT_MS) {
+          failure = FAULT_PRELIFT;
+          phase = PitchSequencePhase::Fault;
+        }
+      }
+      if (phase == PitchSequencePhase::Tracking) {
+        result.trajectory_elapsed_ms = (now - trajectory_start) % period;
+        target = sample_reference(result.trajectory_elapsed_ms);
+      }
+      if (phase != PitchSequencePhase::Fault) {
+        // After prelift, preserve clearance below the trajectory minimum rather
+        // than using a soft bound only one degree above the physical stop.
+        pitch_config.angle_min_rad = phase == PitchSequencePhase::Tracking ?
+          tracking_lower : physical_lower;
+        const AxisFeedback actual = {imu.pitch_rad, speed, imu.stamp_ms, true};
+        result.pitch = update_axis(pitch_state, pitch_config, actual,
+          target.pitch, target.pitch_vel, target.pitch_acc, dt, true);
+        const auto boundary = pitch_boundary_torque(imu.pitch_rad, speed,
+          result.pitch.control_output, pitch_config.angle_min_rad, pitch_config.angle_max_rad);
+        result.pitch.control_output = boundary.torque;
+        result.pitch_boundary_braking = boundary.lower_braking || boundary.upper_braking;
+        if (boundary.lower_braking && pitch_state.speed.integral < 0.0f)
+          pitch_state.speed.integral = 0.0f;
+        if (boundary.upper_braking && pitch_state.speed.integral > 0.0f)
+          pitch_state.speed.integral = 0.0f;
+        result.calibrated = true;
+        result.active = finite_output(result.pitch);
+        if (phase == PitchSequencePhase::Tracking) {
+          error_ms = std::fabs(result.pitch.angle_error_rad) > c::FOLLOW_MAX_TRACKING_ERROR_RAD ?
+            error_ms + elapsed : 0;
+          if (error_ms >= c::FOLLOW_TRACKING_ERROR_MS) {
+            failure = FAULT_TRACKING_ERROR;
+            phase = PitchSequencePhase::Fault;
+          }
+          if (imu.pitch_rad < tracking_lower || imu.pitch_rad > pitch_config.angle_max_rad) {
+            failure = FAULT_BOUNDARY;
+            phase = PitchSequencePhase::Fault;
+          }
+        }
+        if (!result.active) {
+          failure = FAULT_CONFIG;
+          phase = PitchSequencePhase::Fault;
+        } else if (phase != PitchSequencePhase::Fault &&
+                   !pitch_start::submit_pitch_follow_torque(
+                     result.pitch.control_output * c::HOME_PITCH_DIRECTION, now)) {
+          failure = FAULT_FEEDBACK;
+          phase = PitchSequencePhase::Fault;
+        }
+      }
+    }
+    if (phase == PitchSequencePhase::Fault) {
+      result.active = false;
+      result.pitch.control_output = 0.0f;
+      // A following error is not an instruction to let a gravity-loaded joint
+      // fall. With trustworthy IMU/motor feedback, stop the plan and hold a
+      // bounded position. Sensor/bus/timing faults and explicit stop still zero.
+      const bool can_hold = pitch_support_fault(failure) && have_speed && imu.valid &&
+        std::isfinite(imu.pitch_rad) && std::isfinite(speed) && result.feedback_fresh &&
+        prepared.homed && prepared.m2006_locked && enabled && !rc_stop &&
+        elapsed <= c::FOLLOW_MAX_STEP_MS;
+      if (can_hold) {
+        hold_config.angle_min_rad = reference_started ? tracking_lower : physical_lower;
+        if (!fault_hold_captured) {
+          fault_hold_target = clamp(imu.pitch_rad, hold_config.angle_min_rad, hold_config.angle_max_rad);
+          pitch_state.angle = PidState{};
+          pitch_state.speed_command = 0.0f;
+          pitch_state.ff_direction = 0.0f;
+          pitch_state.breakaway = false;
+          // Retain learned upward support, discard an accumulated downward drive.
+          if (pitch_state.speed.integral < 0.0f) pitch_state.speed.integral = 0.0f;
+          fault_hold_captured = true;
+        }
+        const AxisFeedback actual = {imu.pitch_rad, speed, imu.stamp_ms, true};
+        const float planned = result.pitch.target_angle_rad;
+        result.pitch = update_axis(pitch_state, hold_config, actual,
+          fault_hold_target, 0.0f, 0.0f, dt, true);
+        const auto boundary = pitch_boundary_torque(imu.pitch_rad, speed,
+          result.pitch.control_output, hold_config.angle_min_rad, hold_config.angle_max_rad);
+        result.pitch.control_output = boundary.torque;
+        result.pitch.target_angle_rad = planned;  // Display plan; limited_angle identifies hold target.
+        result.pitch_boundary_braking = boundary.lower_braking || boundary.upper_braking;
+        result.pitch_fault_holding = finite_output(result.pitch) &&
+          pitch_start::submit_pitch_follow_torque(result.pitch.control_output * c::HOME_PITCH_DIRECTION, now);
+      }
+      if (!result.pitch_fault_holding) {
+        if (fault_hold_captured) failure = FAULT_FEEDBACK;  // Never resume holding after validity is lost.
+        result.pitch.control_output = 0.0f;
+        reset_axis(pitch_state);
+        (void)pitch_start::submit_pitch_follow_torque(0.0f, now);
+      }
+    }
+    result.pitch_reference_started = reference_started;
+    result.fault = failure;
+    result.pitch_sequence_phase = phase;
+    taskENTER_CRITICAL();
+    latest = result;
+    taskEXIT_CRITICAL();
+    if (elapsed > c::FOLLOW_MAX_STEP_MS) wake = now;
+  }
+}
+
+
 void run()
 {
   TickType_t wake = xTaskGetTickCount();
@@ -593,8 +918,12 @@ void run()
 extern "C" void trajectory_follow_task(void const * argument)
 {
   (void)argument;
-  // Neither test is a startup prerequisite. A selected test owns the motors
-  // for this test run; it never automatically hands over to trajectory tracking.
+  // Tests remain peers. Only the explicit pitch sequence below hands control
+  // from pitch_start to tracking; other selected tests keep exclusive ownership.
+  if (control_constants::FOLLOW_PITCH_SEQUENCE_ENABLED) {
+    trajectory_follow::run_pitch_sequence();
+    return;
+  }
   while (::homing::selected() || ::pitch_start::selected())
     vTaskDelay(pdMS_TO_TICKS(10));
   while (!gimbal_can::start()) vTaskDelay(pdMS_TO_TICKS(100));

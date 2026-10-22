@@ -74,7 +74,7 @@ constexpr float HOME_PITCH_MAX_TRAVEL_RAD = 1.570796327f;  // Software search ca
 // After rear-stop detection, GM6020 reverses relative to its own seated angle.
 // M2006 remains zero-current until the GM6020 return is complete and stationary.
 constexpr float HOME_PITCH_RETURN_MOVE_RAD =
-  0.4363323130f;  // phase A lift: 20 deg  // phase A lift: 25 deg (was 20)  // 20 deg first phase  // 15 deg backoff driven by the M2006 // GM6020 shaft 30 deg backoff. // GM6020 shaft 15 deg backoff.
+  0.3490658504f;  // reverted to 20 deg  // phase A lift: 3 deg (was 20)  // phase A lift: 20 deg  // phase A lift: 25 deg (was 20)  // 20 deg first phase  // 15 deg backoff driven by the M2006 // GM6020 shaft 30 deg backoff. // GM6020 shaft 15 deg backoff.
 constexpr unsigned HOME_PITCH_RETURN_RELEASE_MS = 100U;  // Clear rearward current first.
 constexpr float HOME_PITCH_RETURN_POSITION_KP =
   3.0f;  // reverted  // return position gain: 3.0 -> 5.0 (reach the limit sooner)
@@ -164,7 +164,7 @@ constexpr float HOME_M2006_DRIVE_DIR =
   -1.0f;  // flipped: previous sign pushed into the stop  // gearbox gives headroom: was 0.45 (25% of axis max)  // constant torque used for both M2006 moves
 // After the 15 deg backoff the 6020 locks, then the M2006 keeps turning 45 deg more.
 constexpr float HOME_M2006_CONTINUE_RAD =
-  0.3490658504f;  // phase B: 20 deg more (arm angle)  // phase B: 30 deg  // 30 deg instead of 45 deg  // max available for the M2006 path  // was 0.80: near GM6020 max (2.2 Nm)
+  0.3490658504f;  // reverted to 20 deg  // phase B: another 3 deg  // phase B: 20 deg more (arm angle)  // phase B: 30 deg  // 30 deg instead of 45 deg  // max available for the M2006 path  // was 0.80: near GM6020 max (2.2 Nm)
 constexpr float HOME_M2006_POSITION_KP = 3.0f;
 // Done-stage M2006 hold is DAMPING ONLY: the position loop hunted through the
 // lead-screw backlash and rocked the whole pitch axis.
@@ -354,11 +354,52 @@ constexpr float FOLLOW_YAW_RATIO = 1.0f;
 constexpr float FOLLOW_PITCH_RATIO = 1.0f;
 // 关节角随编码器角增长。若某轴反向追、误差越追越大，把对应方向改成 -1。
 constexpr float FOLLOW_YAW_DIRECTION = 1.0f;
-constexpr float FOLLOW_PITCH_DIRECTION = 1.0f;
+constexpr float FOLLOW_PITCH_DIRECTION =
+  -1.0f;  // reverted to previous version  // reverted: direction was correct  // FIX: encoder sign was inverted -> loop ran to the limit
+
+// Optional pitch_start -> IMU pitch-only tracking sequence. Homing stays a peer test.
+constexpr bool FOLLOW_AFTER_PITCH_START = true;
+constexpr bool FOLLOW_PITCH_SEQUENCE_ENABLED = FOLLOW_AFTER_PITCH_START && PITCH_START_ENABLED;
+constexpr float FOLLOW_PITCH_PRELIFT_RAD = 0.05235987756f;  // Actual body travel: 3 deg.
+constexpr unsigned FOLLOW_PITCH_PRELIFT_TIME_MS = 2000U;
+constexpr unsigned FOLLOW_PITCH_PRELIFT_SETTLE_MS = 300U;
+constexpr unsigned FOLLOW_PITCH_PRELIFT_TIMEOUT_MS = 8000U;
+constexpr float FOLLOW_PITCH_PRELIFT_TOL_RAD = 0.0034906585f;  // 0.2 deg.
+constexpr float FOLLOW_PITCH_PRELIFT_QUIET_RAD_S = 0.035f;
+constexpr float FOLLOW_IMU_SPEED_FILTER_S = 0.005f;
+constexpr float FOLLOW_PITCH_USABLE_TRAVEL_RAD = 1.570796327f;  // Measured about 90 deg.
+constexpr float FOLLOW_PITCH_LOWER_MARGIN_RAD = 0.01745329252f;
+constexpr float FOLLOW_PITCH_UPPER_MARGIN_RAD = 0.03490658504f;
+// Two-period reference peaks: 4.154 rad/s and 17.261 rad/s^2.
+constexpr float FOLLOW_PITCH_TEST_MAX_SPEED_RAD_S = 5.0f;
+constexpr float FOLLOW_PITCH_TEST_MAX_ACCEL_RAD_S2 = 30.0f;
+constexpr float FOLLOW_PITCH_TRACK_FLOOR_TOL_RAD =
+  0.01745329252f;  // 1 deg below the lifted start; 2 deg above lower stop.
+constexpr float FOLLOW_PITCH_BRAKE_DECEL_RAD_S2 = 20.0f;
+constexpr float FOLLOW_PITCH_BRAKE_LATENCY_S = 0.015f;
+constexpr float FOLLOW_PITCH_BRAKE_GAIN_NM_PER_RAD_S = 0.20f;
+constexpr float FOLLOW_PITCH_FAULT_HOLD_KP = 4.0f;
+constexpr float FOLLOW_PITCH_FAULT_HOLD_MAX_SPEED_RAD_S = 0.5f;
+constexpr bool FOLLOW_PITCH_SEQUENCE_DIAGNOSTICS = false;  // Append phase/fault as channels 4/5.
+static_assert(
+  FOLLOW_PITCH_PRELIFT_TIME_MS > 0U &&
+    FOLLOW_PITCH_PRELIFT_TIMEOUT_MS > FOLLOW_PITCH_PRELIFT_TIME_MS &&
+    FOLLOW_PITCH_PRELIFT_RAD > FOLLOW_PITCH_LOWER_MARGIN_RAD &&
+    FOLLOW_PITCH_USABLE_TRAVEL_RAD >
+      FOLLOW_PITCH_PRELIFT_RAD + 1.047197552f + FOLLOW_PITCH_UPPER_MARGIN_RAD,
+  "Invalid pitch prelift/physical travel");
+static_assert(
+  FOLLOW_PITCH_TRACK_FLOOR_TOL_RAD > 0.0f &&
+    FOLLOW_PITCH_TRACK_FLOOR_TOL_RAD < FOLLOW_PITCH_PRELIFT_RAD - FOLLOW_PITCH_LOWER_MARGIN_RAD &&
+    FOLLOW_PITCH_BRAKE_DECEL_RAD_S2 > 0.0f && FOLLOW_PITCH_BRAKE_LATENCY_S >= 0.0f &&
+    FOLLOW_PITCH_BRAKE_GAIN_NM_PER_RAD_S > 0.0f && FOLLOW_PITCH_FAULT_HOLD_KP > 0.0f &&
+    FOLLOW_PITCH_FAULT_HOLD_MAX_SPEED_RAD_S > 0.0f,
+  "Invalid pitch boundary/hold configuration");
 
 // ---- 运行模式 ----
 // false = 两轴都跟随（当前测 pitch 需要它，否则 pitch 力矩恒为 0）
-constexpr bool FOLLOW_SINGLE_YAW = false;  // yaw-only test: no pitch feedback required
+constexpr bool FOLLOW_SINGLE_YAW =
+  false;  // false = both axes; yaw torque limited below  // yaw-only test: no pitch feedback required
 // 恒力矩台架测试：不做闭环，只输出固定力矩（测静摩擦、确认转向）。测完必须改回 false。
 // 【方向符号已验证：正力矩 → 实际角度增大，符号正确，DIRECTION 保持 1.0】
 constexpr bool FOLLOW_CONSTANT_TORQUE_TEST = false;
@@ -367,9 +408,10 @@ constexpr float FOLLOW_TEST_TRIP_SPEED_RAD_S = 5.23598776f;  // 50 rpm，超速�
 // 机械行程保护：裸电机阶段关闭；装上云台后打开并填真实行程。
 constexpr bool FOLLOW_ENFORCE_ANGLE_LIMITS = false;
 // 时间缩放：1 = 原始 680 ms 周期（最快）；2/4 = 放慢并同时降低速度、加速度。
-constexpr unsigned FOLLOW_TRAJECTORY_TIME_SCALE = 2U;  // 1360 ms/圈（缩放 4 已验证 OK，提速一档）
+constexpr unsigned FOLLOW_TRAJECTORY_TIME_SCALE =
+  1U;  // 0:03 baseline: period x1  // required: original period  // period x2 = the setting where it fitted perfectly  // Pitch sequence: original 680 ms cycle; original trajectory files stay unchanged.
 constexpr bool FOLLOW_START_ENABLED =
-  false;  // pitch_start test: yaw follow off  // Auto-start yaw after fresh feedback and initial pose capture.
+  true;  // pitch follow test  // pitch_start test: yaw follow off  // Auto-start yaw after fresh feedback and initial pose capture.
 constexpr bool FOLLOW_AUTO_CAPTURE_INITIAL_POSE = true;  // 上电自动记录初始姿态
 constexpr bool FOLLOW_USE_RC_STOP = false;               // 用遥控器右拨杆下档急停
 
@@ -394,7 +436,8 @@ constexpr float FOLLOW_OVERSPEED_FACTOR = 1.5f;
 // 裸电机 J 很小(≈1.3e-4)、无重力，所以前两项为 0；摩擦项是裸电机跟踪的关键。
 constexpr float FOLLOW_YAW_ACCEL_FF_J = 0.0f;  // kg·m^2
 constexpr float FOLLOW_PITCH_ACCEL_FF_J = 0.0f;
-constexpr float FOLLOW_PITCH_GRAVITY_NM = 0.0f;  // m·g·r
+constexpr float FOLLOW_PITCH_GRAVITY_NM =
+  0.10f;  // tau = 0.15kg * 9.81 * 0.07m = 0.103 Nm  // 0 -> 0.80: heavy head needs gravity feedforward  // m·g·r
 // 库仑摩擦前馈（N·m）。裸电机实测启动摩擦约 0.1 A ≈ 0.074 N·m；
 // 取 0.05 既能把低速"粘住"补掉，又不会在停顿反向点造成震动（实测最优）。
 constexpr float FOLLOW_YAW_FRICTION_NM =
@@ -442,25 +485,30 @@ constexpr float FOLLOW_YAW_MAX_SPEED_RAD_S = 10.0f;  // 原始周期峰值 7.15
 constexpr float FOLLOW_YAW_MAX_ACCEL_RAD_S2 =
   300.0f;  // revert: 450 was worse  // 300 -> 450: the small spikes at each peak need sharper accel  // 130 -> 300: 130 clipped the corner accelerations  // 原始周期峰值 106.9
 constexpr float FOLLOW_YAW_MAX_TORQUE_NM =
-  0.95f;  // 0.80 -> 0.95 (single change: peaks may be torque-clipped)  // back to the 0.237 best  // 0.80 -> 1.20: extra authority to escape the notch  // 0.40 clipped the acceleration      // ≈0.54 A
+  0.02f;  // pitch-only: yaw gets essentially no authority  // 0.80 -> 0.95 (single change: peaks may be torque-clipped)  // back to the 0.237 best  // 0.80 -> 1.20: extra authority to escape the notch  // 0.40 clipped the acceleration      // ≈0.54 A
 constexpr float FOLLOW_YAW_VELOCITY_FF = 1.0f;
 constexpr bool FOLLOW_YAW_CONFIGURED = true;
 
 // pitch 轴：与 yaw 同步为"装云台"整定值（内环必须加强，否则跟随严重滞后）
-constexpr float FOLLOW_PITCH_ANGLE_KP = 20.0f;  // pitch 惯量小，yaw 的 15 会超调 60%，先降到 6
-constexpr float FOLLOW_PITCH_ANGLE_KI = 2.0f;
-constexpr float FOLLOW_PITCH_ANGLE_KD = 0.0f;
-constexpr float FOLLOW_PITCH_ANGLE_INTEGRAL_LIMIT = 0.30f;
-constexpr float FOLLOW_PITCH_SPEED_KP = 0.080f;  // pitch 惯量小，内环适当降低（yaw 用 0.13）
-constexpr float FOLLOW_PITCH_SPEED_KI = 0.45f;
+constexpr float FOLLOW_PITCH_ANGLE_KP =
+  40.0f;  // 0:03 baseline  // 40 -> 70: match the yaw-proven value  // 1.0 -> 40: was 70x too small  // pitch 惯量小，yaw 的 15 会超调 60%，先降到 6
+constexpr float FOLLOW_PITCH_ANGLE_KI =
+  3.0f;  // 0:03 baseline  // 3 -> 6  // 8 -> 3: integral drove the overshoot at the peak  // reverted  // 8 -> 3: integral windup drove it up  // 2 -> 8: needs integral against gravity
+constexpr float FOLLOW_PITCH_ANGLE_KD = 0.90f;  // step 1: match VELOCITY_FF=0.90 so the feedforward is not eaten  // 0:03 baseline  // matched with FF  // 0 -> 1.0: matches VELOCITY_FF=1.0, adds damping against overshoot
+constexpr float FOLLOW_PITCH_ANGLE_INTEGRAL_LIMIT =
+  0.60f;  // reverted  // 0.60 -> 0.15: tighter anti-windup  // 0.30 -> 0.60: room for the gravity torque
+constexpr float FOLLOW_PITCH_SPEED_KP =
+  0.22f;  // 0:03 baseline  // keep the damping that fixed the overshoot  // 0.11 -> 0.22: inner-loop damping is what stops the overshoot  // 0.08 -> 0.15: heavy axis has more inertia, tolerates more gain  // pitch 惯量小，内环适当降低（yaw 用 0.13）
+constexpr float FOLLOW_PITCH_SPEED_KI = 0.30f;  // 0:03 baseline  // 0.40 -> 0.30: less integral in the speed loop
 constexpr float FOLLOW_PITCH_SPEED_KD = 0.0f;
 constexpr float FOLLOW_PITCH_SPEED_INTEGRAL_LIMIT = 0.25f;
 constexpr float FOLLOW_PITCH_ANGLE_MIN_RAD = 0.0f;
 constexpr float FOLLOW_PITCH_ANGLE_MAX_RAD = 0.0f;
-constexpr float FOLLOW_PITCH_MAX_SPEED_RAD_S = 10.0f;    // 原始周期峰值 8.31
-constexpr float FOLLOW_PITCH_MAX_ACCEL_RAD_S2 = 130.0f;  // 原始周期峰值 69.0
-constexpr float FOLLOW_PITCH_MAX_TORQUE_NM = 0.40f;
-constexpr float FOLLOW_PITCH_VELOCITY_FF = 1.0f;
+constexpr float FOLLOW_PITCH_MAX_SPEED_RAD_S = 15.0f;  // 10 -> 15    // 原始周期峰值 8.31
+constexpr float FOLLOW_PITCH_MAX_ACCEL_RAD_S2 = 250.0f;  // 0:03 baseline  // 250 -> 600: 2x speed needs 4x accel  // 130 -> 250  // 原始周期峰值 69.0
+constexpr float FOLLOW_PITCH_MAX_TORQUE_NM =
+  0.80f;  // 0:03 baseline  // 0.80 -> 1.80: 2x speed needs 2x torque, was saturating  // reverted  // 0.80 -> 0.30: load is only 0.10 Nm, huge gain slammed to the limit  // 1.80 -> 0.80: load is only 0.1 Nm, keep headroom but not excessive  // 0.40 -> 1.80: THIS was the stall (GM6020 max 2.22)
+constexpr float FOLLOW_PITCH_VELOCITY_FF = 0.90f;  // 0:03 baseline  // back to 1.0: must match ANGLE_KD  // 1.0 -> 0.90: reduce lead, keep some
 constexpr bool FOLLOW_PITCH_CONFIGURED = true;
 
 // 微分滤波时间常数（当前 Kd = 0，保留以便以后启用）
@@ -500,7 +548,7 @@ constexpr unsigned FOLLOW_HOMING_BACKOFF_TIMEOUT_MS = 3000U;  // 回退超时（
 constexpr unsigned FOLLOW_PLOT_MODE = 1U;
 constexpr bool FOLLOW_YAW_DIAGNOSTICS = false;  // 当前：双轴反馈帧数诊断（查 pitch 电机是否在线）
 // 模式 1 画哪根轴：0 = yaw（目标/实际），1 = pitch（目标/实际）
-constexpr unsigned FOLLOW_PLOT_AXIS = 0U;
+constexpr unsigned FOLLOW_PLOT_AXIS = 1U;  // show pitch  // 0 -> 1: show the pitch axis
 
 static_assert(
   FOLLOW_YAW_MOTOR_ID >= 1U && FOLLOW_YAW_MOTOR_ID <= 4U && FOLLOW_PITCH_MOTOR_ID >= 1U &&

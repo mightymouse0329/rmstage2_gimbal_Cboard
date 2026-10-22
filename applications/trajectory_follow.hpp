@@ -53,6 +53,9 @@ constexpr uint8_t FAULT_FEEDBACK = 3;
 constexpr uint8_t FAULT_TIMING = 4;
 constexpr uint8_t FAULT_CONFIG = 5;
 constexpr uint8_t FAULT_IMU = 6;
+constexpr uint8_t FAULT_PRELIFT = 7;
+constexpr uint8_t FAULT_BOUNDARY = 8;
+enum class PitchSequencePhase : uint8_t { Waiting=0, Prelift=1, Tracking=2, Fault=3 };
 
 struct Result
 {
@@ -66,11 +69,18 @@ struct Result
   bool calibrated;
   bool rc_stop;
   uint8_t fault;  // FAULT_*，停机原因，便于在曲线上定位
+  bool pitch_only;
+  PitchSequencePhase pitch_sequence_phase;
+  bool pitch_reference_started;
+  bool pitch_fault_holding;
+  bool pitch_boundary_braking;
 };
 
 // 任务上下文接口。反馈由 CAN1 适配器每周期刷新，set_feedback 保留兼容。
 void set_feedback(const Feedback & feedback);
 Result read();  // 给绘图用的一致性快照
+// Same slow reference for control and grading; raw trajectory files remain untouched.
+TrajectoryPoint sample_reference(uint32_t elapsed_ms);
 void set_enabled(bool enabled);
 // 在停机状态、物理摆到期望初始姿态时调用；有新鲜反馈后异步生效。
 bool request_initial_pose_capture();

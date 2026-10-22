@@ -37,6 +37,7 @@ State read();
 bool ready();
 // Called once by trajectory_follow at the SAME initial-pose capture as encoders.
 bool capture_reference(float initial_yaw_rad, float initial_pitch_rad);
+bool capture_reference(float initial_yaw_rad, float initial_pitch_rad, float pitch_direction);
 }  // namespace gimbal_imu
 
 #endif

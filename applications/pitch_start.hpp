@@ -25,6 +25,7 @@ struct Status {
   uint32_t stall_elapsed_ms;
   float pitch_zero_rad;  // GM6020 final 60-degree target; RAM only.
   float m2006_zero_rad;
+  float pitch_up_imu_direction;  // Raw IMU sign observed while GM6020 moves positively.
   bool homed;
   bool m2006_locked;  // 1 = M2006 hold engaged
   bool feedback_fresh;
@@ -36,6 +37,8 @@ bool selected();
 void start();
 void cancel();
 Status snapshot();
+// Accepted only after successful preparation. Keeps M2006 hold and transfers only GM6020.
+bool submit_pitch_follow_torque(float torque_nm, uint32_t now_ms);
 bool receive_can1(const CAN_RxHeaderTypeDef &, uint8_t *, uint32_t now_ms);
 void transmit_can1(uint32_t now_ms);
 }

@@ -15,7 +15,7 @@
 #include "usart.h"
 
 // USART1 / physical 4-pin UART2: AA BB + byte length + little-endian floats.
-// Yaw test: target angle (rad), actual IMU angle (rad), score (0..1); 3 floats.
+// Yaw/pitch test: target angle (rad), actual IMU angle (rad), score (0..1); 3 floats.
 // Infrared mode, when explicitly enabled: distance and reception diagnostics.
 // Other plot modes below are inactive while INFRARED_PLOT_TEST is true.
 
@@ -28,7 +28,18 @@ extern "C" void plot_task()
   uint32_t last_wake = osKernelSysTick();
   for (;;) {
     osDelayUntil(&last_wake, 20);
-    if (homing::selected() || pitch_start::selected()) {
+    if (control_constants::FOLLOW_PITCH_SEQUENCE_ENABLED) {
+      const auto score = grading::read();
+      if (control_constants::FOLLOW_PITCH_SEQUENCE_DIAGNOSTICS) {
+        const auto state = trajectory_follow::read();
+        // 4: 0 waiting / 1 prelift / 2 tracking / 3 fault. 5: FAULT_*.
+        plotter.plot(score.target_pitch_rad, score.actual_pitch_rad, score.pitch_ratio,
+          static_cast<float>(state.pitch_sequence_phase), static_cast<float>(state.fault));
+      } else {
+        plotter.plot(score.target_pitch_rad, score.actual_pitch_rad, score.pitch_ratio);
+      }
+    }
+    else if (homing::selected() || pitch_start::selected()) {
       // 两个模块的 Status 类型不同，用共同字段手工取值。
       const bool use_home = homing::selected();
       const auto hs = homing::snapshot();

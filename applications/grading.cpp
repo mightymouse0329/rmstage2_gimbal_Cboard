@@ -72,26 +72,35 @@ void run()
     score.actual_pitch_rad = imu.valid ? imu.pitch_rad : missing;
     const int32_t sample_offset = static_cast<int32_t>(imu.stamp_ms-state.stamp_ms);
     const int32_t max_offset = control_constants::FOLLOW_MAX_STEP_MS;
-    const bool tracking = imu.valid && !homing::selected() && !pitch_start::selected() &&
+    const bool owner_allows = state.pitch_only ?
+      state.pitch_sequence_phase == trajectory_follow::PitchSequencePhase::Tracking :
+      (!homing::selected() && !pitch_start::selected());
+    const bool tracking = imu.valid && owner_allows &&
       state.active && state.calibrated &&
       state.feedback_fresh && state.fault == trajectory_follow::FAULT_NONE &&
       now - state.stamp_ms <= control_constants::FOLLOW_MAX_STEP_MS &&
       !control_constants::FOLLOW_CONSTANT_TORQUE_TEST &&
       sample_offset >= -max_offset && sample_offset <= max_offset;
-    if (tracking) {
+    // The plan remains visible after a latched motion fault. Only scoring is
+    // gated by tracking; do not replace the reference with a constant on stop.
+    if (tracking || (state.pitch_only && state.pitch_reference_started)) {
       // Evaluate the SAME plan at the IMU timestamp, avoiding a one-tick
       // phase error between the separate control and grading tasks.
       constexpr uint32_t scale = control_constants::FOLLOW_TRAJECTORY_TIME_SCALE;
       constexpr int32_t period_ms = TRAJECTORY_PERIOD_MS * scale;
-      int32_t phase = static_cast<int32_t>(state.trajectory_elapsed_ms) + sample_offset;
+      const int32_t aligned_offset = sample_offset >= -max_offset && sample_offset <= max_offset ?
+        sample_offset : 0;
+      int32_t phase = static_cast<int32_t>(state.trajectory_elapsed_ms) + aligned_offset;
       if (phase < 0) phase += period_ms;
-      const auto reference = trajectory_sample_at_ms((phase % period_ms) / scale);
+      const auto reference = state.pitch_only ?
+        trajectory_follow::sample_reference(static_cast<uint32_t>(phase % period_ms)) :
+        trajectory_sample_at_ms((phase % period_ms) / scale);
       score.target_yaw_rad = reference.yaw;
       score.target_pitch_rad = reference.pitch;
     }
-    score.yaw_active = tracking && std::isfinite(imu.yaw_rad) &&
+    score.yaw_active = tracking && !state.pitch_only && std::isfinite(imu.yaw_rad) &&
       std::isfinite(state.yaw.target_angle_rad);
-    score.pitch_active = tracking && !control_constants::FOLLOW_SINGLE_YAW &&
+    score.pitch_active = tracking && (state.pitch_only || !control_constants::FOLLOW_SINGLE_YAW) &&
       std::isfinite(imu.pitch_rad) && std::isfinite(state.pitch.target_angle_rad);
 
     if (score.yaw_active) {
