@@ -9,6 +9,11 @@ namespace control_constants
 // -> dual IMU following for 5s -> weak GM6020 holds; M2006 keeps strong holding.
 // false: every original standalone/one-axis/two-axis test selector works as before.
 constexpr bool INFRARED_PITCH_AUTO_ENABLE = true;
+
+// infrared_pitch_auto 运行时的串口模式：
+//   true  = 7 通道精简模式：yaw目标/实际(°)、pitch目标/实际(°)、yaw分数、pitch分数、红外距离(cm)
+//   false = 18 通道诊断模式
+constexpr bool INFRARED_AUTO_PLOT_COMPACT = true;
 constexpr float INFRARED_AUTO_TRIGGER_CM = 50.0f;
 constexpr unsigned INFRARED_AUTO_PREPARE_DELAY_MS = 43000U;
 constexpr unsigned INFRARED_AUTO_FOLLOW_MS = 10000U;

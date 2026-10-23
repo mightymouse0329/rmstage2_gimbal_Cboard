@@ -46,6 +46,19 @@ extern "C" void plot_task()
       // 17 actual tracking age(s), 18 IMU calibration progress.
       // On automatic overspeed fault only: 16 fault-origin phase, 17 pitch speed,
       // 18 M2006 speed (both rad/s), latched BEFORE stopping.
+      if (control_constants::INFRARED_AUTO_PLOT_COMPACT) {
+        // 7 通道精简模式（单位：前 4 个为度 °）
+        //   1 = yaw 目标   2 = yaw 实际
+        //   3 = pitch 目标 4 = pitch 实际
+        //   5 = yaw 分数   6 = pitch 分数
+        //   7 = 红外测距（cm，无效时 NaN）
+        const float missing = std::numeric_limits<float>::quiet_NaN();
+        plotter.plot(score.target_yaw_rad*kRadToDeg, score.actual_yaw_rad*kRadToDeg,
+          score.target_pitch_rad*kRadToDeg, score.actual_pitch_rad*kRadToDeg,
+          score.yaw_ratio, score.pitch_ratio,
+          automatic.infrared_triggered ? automatic.distance_cm : missing);
+        continue;
+      }
       const bool automatic_overspeed=automatic.stage==infrared_pitch_auto::Stage::Fault &&
         automatic.fault==infrared_pitch_auto::Fault::Overspeed;
       plotter.plot(score.target_yaw_rad*kRadToDeg,score.actual_yaw_rad*kRadToDeg,
