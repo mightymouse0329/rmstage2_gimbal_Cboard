@@ -51,6 +51,8 @@ void transform(const float in[3], float out[3]) {
 void begin() {
   static_assert(configTICK_RATE_HZ == 1000, "IMU requires 1ms ticks");
   work=State{};
+  reset_calibration();  // Also clear statistics and sums if begin() is called again.
+  calibration_start=0;
   aligned=false;
   publish();
   // APB2 is 84 MHz. /16 gives 5.25 MHz, below BMI088's 10 MHz SPI maximum.
@@ -104,7 +106,8 @@ void update() {
     }
     if (!calibration_noise.add(w,now,c::IMU_CALIBRATION_BLOCK_MS,
                                c::IMU_CALIBRATION_MEAN_SPREAD_RAD_S)) {
-      work.calibration_restart_reason=3;
+      work.calibration_rejected_std_rad_s=calibration_noise.max_std_rad_s();
+      work.calibration_restart_reason=5;
       reset_calibration();publish();return;
     }
     work.calibration_std_rad_s=calibration_noise.max_std_rad_s();
@@ -116,6 +119,7 @@ void update() {
     if (work.calibration_samples>=c::IMU_CALIBRATION_MIN_SAMPLES &&
         work.calibration_elapsed_ms>=c::IMU_CALIBRATION_MS) {
       if (work.calibration_std_rad_s>c::IMU_CALIBRATION_STD_RAD_S) {
+        work.calibration_rejected_std_rad_s=work.calibration_std_rad_s;
         work.calibration_restart_reason=3;
         reset_calibration();publish();return;
       }
@@ -123,7 +127,9 @@ void update() {
         work.bias_rad_s[i]=gyro_sum[i]/work.calibration_samples;
         a[i]=acc_sum[i]/work.calibration_samples;
       }
-      if (!attitude.begin(a)) {fail(Fault::Range);return;}
+      if (!attitude.begin(a,c::FOLLOW_BOTH_ENABLE && c::IMU_GIMBAL_AXIS_PROJECTION)) {
+        fail(Fault::Range);return;
+      }
       work.raw_yaw_rad=attitude.yaw; work.raw_pitch_rad=attitude.pitch;
       work.phase=Phase::Ready; work.ready=true;
     }
@@ -134,12 +140,19 @@ void update() {
     fail(Fault::Range);return;
   }
   work.raw_yaw_rad=attitude.yaw; work.raw_pitch_rad=attitude.pitch;
+  work.world_yaw_rate_rad_s=attitude.world_vertical_rate(w);
+  if (!std::isfinite(work.world_yaw_rate_rad_s)) {fail(Fault::Range);return;}
   publish();
 }
 
 State read() {
+  State result;
+  read(result);
+  return result;
+}
+void read(State & result) {
   taskENTER_CRITICAL();
-  State result=latest;
+  result=latest;
   const bool referenced=aligned;
   const float yo=yaw_origin, po=pitch_origin, yr=yaw_reference, pr=pitch_reference;
   const float pitch_direction=aligned_pitch_direction;
@@ -152,7 +165,6 @@ State read() {
     result.yaw_rad=yr+c::IMU_YAW_DIRECTION*(result.raw_yaw_rad-yo);
     result.pitch_rad=pr+pitch_direction*(result.raw_pitch_rad-po);
   }
-  return result;
 }
 bool ready() {return read().ready;}
 bool capture_reference(float yaw_rad,float pitch_rad) {

@@ -21,6 +21,9 @@
 
 sp::Plotter plotter(&huart1, false);
 
+// 串口用角度（°）显示，方便读曲线。
+static constexpr float kRadToDeg = 57.29577951f;
+
 // 底盘诊断快照（定义在 chassis_task.cpp）：0=FL 1=FR 2=RL 3=RR
 
 extern "C" void plot_task()
@@ -28,15 +31,94 @@ extern "C" void plot_task()
   uint32_t last_wake = osKernelSysTick();
   for (;;) {
     osDelayUntil(&last_wake, 20);
-    if (control_constants::FOLLOW_PITCH_SEQUENCE_ENABLED) {
+    if (control_constants::FOLLOW_BOTH_ENABLE) {
+      const auto score = grading::read();
+      // First six channels share one trajectory phase; optional diagnostics follow.
+      if (control_constants::FOLLOW_BOTH_RUNTIME_DIAGNOSTICS) {
+        static trajectory_follow::SequenceDiagnostics trace;
+        static pitch_start::CanDiagnostics bus;
+        trajectory_follow::read_sequence_diagnostics(trace);
+        pitch_start::read_can_diagnostics(bus);
+        static gimbal_imu::State startup_imu;
+        static pitch_start::Status startup_preparation;
+        gimbal_imu::read(startup_imu);
+        if (control_constants::IMU_STARTUP_DIAGNOSTICS && !startup_imu.aligned) {
+          // Same 18-float frame. Ch7=-1 identifies the startup-only layout.
+          // Keep it visible through calibration and preparation faults, until
+          // the follower captures its IMU origin before the 3-degree prelift.
+          pitch_start::snapshot(startup_preparation);
+          static trajectory_follow::TransportStatus startup_transport;
+          static uint32_t previous_rx[3] = {};
+          static float rx_frames[3] = {};
+          startup_transport = trajectory_follow::read_transport();
+          rx_frames[0] = static_cast<float>(startup_preparation.pitch_rx_frames - previous_rx[0]);
+          rx_frames[1] = static_cast<float>(startup_preparation.m2006_rx_frames - previous_rx[1]);
+          rx_frames[2] = static_cast<float>(startup_transport.yaw_frames - previous_rx[2]);
+          previous_rx[0] = startup_preparation.pitch_rx_frames;
+          previous_rx[1] = startup_preparation.m2006_rx_frames;
+          previous_rx[2] = startup_transport.yaw_frames;
+          if (startup_imu.phase == gimbal_imu::Phase::Ready &&
+              (startup_preparation.stage == pitch_start::Stage::WaitFeedback ||
+               (startup_preparation.stage == pitch_start::Stage::Fault &&
+                startup_preparation.fault == pitch_start::Fault::Feedback))) {
+            // Ch7=-2: calibration passed, diagnose the exact startup gates.
+            // 10 IMU fresh, 11/12/13 pitch/M2006/yaw RX per plot interval,
+            // 14 missing-input mask, 15/16 IMU/controller age, 17 stage, 18 fault.
+            const uint32_t diagnostic_now = xTaskGetTickCount();
+            plotter.plot((score.target_yaw_rad * kRadToDeg), (score.actual_yaw_rad * kRadToDeg),
+              (score.target_pitch_rad * kRadToDeg), (score.actual_pitch_rad * kRadToDeg), score.yaw_ratio, score.pitch_ratio,
+              -2.0f, static_cast<float>(startup_imu.phase), static_cast<float>(startup_imu.fault),
+              startup_imu.ready ? 1.0f : 0.0f, rx_frames[0], rx_frames[1], rx_frames[2],
+              static_cast<float>(bus.waiting_inputs),
+              static_cast<float>(diagnostic_now - startup_imu.stamp_ms),
+              static_cast<float>(diagnostic_now - startup_preparation.stamp_ms),
+              static_cast<float>(startup_preparation.stage), static_cast<float>(startup_preparation.fault));
+            continue;
+          }
+          float progress = static_cast<float>(startup_imu.calibration_elapsed_ms) /
+            control_constants::IMU_CALIBRATION_MS;
+          const float samples = static_cast<float>(startup_imu.calibration_samples) /
+            control_constants::IMU_CALIBRATION_MIN_SAMPLES;
+          if (samples < progress) progress = samples;
+          if (progress > 1.0f || startup_imu.ready) progress = 1.0f;
+          constexpr float degrees = 57.2957795f;
+          plotter.plot((score.target_yaw_rad * kRadToDeg), (score.actual_yaw_rad * kRadToDeg),
+            (score.target_pitch_rad * kRadToDeg), (score.actual_pitch_rad * kRadToDeg), score.yaw_ratio, score.pitch_ratio,
+            -1.0f, static_cast<float>(startup_imu.phase), static_cast<float>(startup_imu.fault),
+            progress, startup_imu.max_raw_gyro_rad_s * degrees,
+            static_cast<float>(startup_imu.calibration_restart_reason),
+            startup_imu.calibration_std_rad_s * degrees,
+            startup_imu.calibration_rejected_std_rad_s * degrees,
+            startup_imu.acceleration_norm_mps2, static_cast<float>(startup_imu.calibration_restarts),
+            static_cast<float>(startup_preparation.stage), static_cast<float>(startup_preparation.fault));
+          continue;
+        }
+        // First six channels stay identical. Fault data 8..12 freezes on the
+        // FIRST failure, before yaw is zeroed by the stop/hold handler.
+        // 15..18 also freeze: motor travel, motor speed, feedback torque, IMU travel.
+        // 7 phase, 8 fault, 9 cause, 10 yaw error, 11 gyro yaw rate,
+        // 12 last queued yaw torque, 13 max control dt, 14 max GM queue gap.
+        plotter.plot((score.target_yaw_rad * kRadToDeg), (score.actual_yaw_rad * kRadToDeg),
+          (score.target_pitch_rad * kRadToDeg), (score.actual_pitch_rad * kRadToDeg), score.yaw_ratio, score.pitch_ratio,
+          static_cast<float>(trace.phase), static_cast<float>(trace.fault),
+          static_cast<float>(trace.cause), trace.yaw_error_rad, trace.yaw_speed_rad_s,
+          trace.yaw_torque_nm, static_cast<float>(trace.max_step_ms), static_cast<float>(bus.max_gap_ms),
+          trace.yaw_motor_travel_rad, trace.yaw_motor_speed_rad_s,
+          trace.yaw_feedback_torque_nm, trace.yaw_imu_travel_rad);
+      } else {
+        plotter.plot((score.target_yaw_rad * kRadToDeg), (score.actual_yaw_rad * kRadToDeg),
+          (score.target_pitch_rad * kRadToDeg), (score.actual_pitch_rad * kRadToDeg), score.yaw_ratio, score.pitch_ratio);
+      }
+    }
+    else if (control_constants::FOLLOW_PITCH_SEQUENCE_ENABLED) {
       const auto score = grading::read();
       if (control_constants::FOLLOW_PITCH_SEQUENCE_DIAGNOSTICS) {
         const auto state = trajectory_follow::read();
         // 4: 0 waiting / 1 prelift / 2 tracking / 3 fault. 5: FAULT_*.
-        plotter.plot(score.target_pitch_rad, score.actual_pitch_rad, score.pitch_ratio,
+        plotter.plot((score.target_pitch_rad * kRadToDeg), (score.actual_pitch_rad * kRadToDeg), score.pitch_ratio,
           static_cast<float>(state.pitch_sequence_phase), static_cast<float>(state.fault));
       } else {
-        plotter.plot(score.target_pitch_rad, score.actual_pitch_rad, score.pitch_ratio);
+        plotter.plot((score.target_pitch_rad * kRadToDeg), (score.actual_pitch_rad * kRadToDeg), score.pitch_ratio);
       }
     }
     else if (homing::selected() || pitch_start::selected()) {
@@ -99,7 +181,7 @@ extern "C" void plot_task()
       if (imu.ready) progress = 1.0f;
       // First three channels are unchanged. Remaining channels diagnose startup.
       plotter.plot(
-        score.target_yaw_rad, score.actual_yaw_rad, score.yaw_ratio,
+        (score.target_yaw_rad * kRadToDeg), (score.actual_yaw_rad * kRadToDeg), score.yaw_ratio,
         static_cast<float>(imu.phase), static_cast<float>(imu.fault),
         static_cast<float>(imu.init_error), progress,
         static_cast<float>(bus.yaw_frames - previous_yaw_frames),
@@ -162,7 +244,7 @@ extern "C" void plot_task()
           // Same aligned IMU values as scoring; NaN while not ready/aligned.
           const auto score = grading::read();
           plotter.plot(
-            score.target_yaw_rad, score.actual_yaw_rad, score.yaw_ratio);
+            (score.target_yaw_rad * kRadToDeg), (score.actual_yaw_rad * kRadToDeg), score.yaw_ratio);
         }
       }
       else {
@@ -183,19 +265,27 @@ extern "C" void plot_task()
         }
         else if (control_constants::FOLLOW_PLOT_AXIS == 1U) {
           const auto score = grading::read();
-          plotter.plot(score.target_pitch_rad, score.actual_pitch_rad);
+          plotter.plot((score.target_pitch_rad * kRadToDeg), (score.actual_pitch_rad * kRadToDeg));
         }
         else {
+          // 双轴跟随：4 通道
+          //   1 = yaw 目标   2 = yaw 实际
+          //   3 = pitch 目标 4 = pitch 实际
           const auto score = grading::read();
-          plotter.plot(score.target_yaw_rad, score.actual_yaw_rad);
+          // 4 通道（单位：度 °）
+          //   1 = yaw 目标   2 = yaw 实际
+          //   3 = pitch 目标 4 = pitch 实际
+          plotter.plot(
+            score.target_yaw_rad * kRadToDeg, score.actual_yaw_rad * kRadToDeg,
+            score.target_pitch_rad * kRadToDeg, score.actual_pitch_rad * kRadToDeg);
         }
       }
     }
     else {
       const auto score = grading::read();
       plotter.plot(
-        score.target_yaw_rad, score.actual_yaw_rad, score.target_pitch_rad,
-        score.actual_pitch_rad);
+        (score.target_yaw_rad * kRadToDeg), (score.actual_yaw_rad * kRadToDeg), (score.target_pitch_rad * kRadToDeg),
+        (score.actual_pitch_rad * kRadToDeg));
     }
   }
 }

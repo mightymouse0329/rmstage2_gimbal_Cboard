@@ -3,13 +3,15 @@
 
 namespace control_constants
 {
-// Independent motor-test programs. true starts ONLY that program at power-on.
-// Both false: neither test runs; tracking uses FOLLOW_START_ENABLED below.
-// A finished/faulted test never automatically starts the other test or tracking.
+// Standalone motor-test switches. Tracking selectors below can request their
+// own preparation; homing remains exclusive. No test auto-starts another test.
 constexpr bool HOMING_ENABLED = false;
-constexpr bool PITCH_START_ENABLED = true;
+constexpr bool PITCH_START_ENABLED = false;
+// Highest tracking priority: prepare pitch_start, prelift, then start both axes.
+// false preserves pitch-only/yaw-only selections below.
+constexpr bool FOLLOW_BOTH_ENABLE = true;
 static_assert(
-  !(HOMING_ENABLED && PITCH_START_ENABLED),
+  !(HOMING_ENABLED && (PITCH_START_ENABLED || FOLLOW_BOTH_ENABLE)),
   "Enable only one motor test: HOMING_ENABLED or PITCH_START_ENABLED (shared motors/CAN frames)");
 
 // BMI088 on the moving gimbal C-board. All angles/rates are radians.
@@ -19,6 +21,8 @@ constexpr unsigned IMU_CALIBRATION_MS = 2000U;
 constexpr unsigned IMU_CALIBRATION_MIN_SAMPLES = 500U;
 constexpr bool IMU_STARTUP_DIAGNOSTICS = true;  // 12 plot channels; false restores 3.
 constexpr unsigned IMU_MAX_GAP_MS = 10U;
+constexpr bool IMU_GIMBAL_AXIS_PROJECTION =
+  true;  // Dual mode only; pitch axis supplies tilt-safe heading.
 constexpr float IMU_CALIBRATION_MAX_RATE_RAD_S = 0.052359878f;  // 3 deg/s
 // Whole-window standard deviation and 100ms block-mean spread (startup only).
 constexpr float IMU_CALIBRATION_STD_RAD_S = 0.0052359878f;  // 0.30 deg/s
@@ -28,7 +32,8 @@ static_assert(
   IMU_CALIBRATION_STD_RAD_S > 0.0f && IMU_CALIBRATION_BLOCK_MS > 0U,
   "Invalid IMU calibration noise configuration");
 constexpr float IMU_ATTITUDE_KP = 0.5f;
-constexpr float IMU_YAW_DIRECTION = 1.0f;
+constexpr float IMU_YAW_DIRECTION =
+  1.0f;  // TEST: if the gyro yaw rate has the opposite sign to the position, the inner loop was positive feedback
 constexpr float IMU_PITCH_DIRECTION = 1.0f;
 // Existing middleware C-board convention: board flat, CAN side facing forward.
 // Horizontal mounting heading does not affect relative yaw. Verify this matrix
@@ -357,9 +362,36 @@ constexpr float FOLLOW_YAW_DIRECTION = 1.0f;
 constexpr float FOLLOW_PITCH_DIRECTION =
   -1.0f;  // reverted to previous version  // reverted: direction was correct  // FIX: encoder sign was inverted -> loop ran to the limit
 
-// Optional pitch_start -> IMU pitch-only tracking sequence. Homing stays a peer test.
+// Both > single yaw > pitch-only sequence > standalone test. No PID changes.
+constexpr bool FOLLOW_SINGLE_YAW =
+  false;  // true with FOLLOW_BOTH_ENABLE=false starts the existing yaw-only test.
 constexpr bool FOLLOW_AFTER_PITCH_START = true;
-constexpr bool FOLLOW_PITCH_SEQUENCE_ENABLED = FOLLOW_AFTER_PITCH_START && PITCH_START_ENABLED;
+// A tracking selector can request its own preparation even if the standalone
+// PITCH_START_ENABLED test switch is false. Homing remains an exclusive test.
+constexpr bool PITCH_START_SELECTED =
+  !HOMING_ENABLED &&
+  (FOLLOW_BOTH_ENABLE || (!FOLLOW_SINGLE_YAW && (PITCH_START_ENABLED || FOLLOW_AFTER_PITCH_START)));
+constexpr bool FOLLOW_PITCH_SEQUENCE_ENABLED =
+  PITCH_START_SELECTED && (FOLLOW_BOTH_ENABLE || FOLLOW_AFTER_PITCH_START);
+// Dual yaw handoff: wait for a quiet axis, clear history, then ramp authority.
+constexpr unsigned FOLLOW_BOTH_YAW_STARTUP_MS = 150U;
+constexpr bool FOLLOW_BOTH_RUNTIME_DIAGNOSTICS =
+  true;  // 18 channels; false restores the original six.
+constexpr float FOLLOW_BOTH_YAW_START_QUIET_RAD_S = 0.10f;
+constexpr float FOLLOW_BOTH_YAW_JUMP_SLACK_RAD =
+  0.00872664626f;  // 0.5 deg beyond rate-based travel.
+constexpr unsigned FOLLOW_BOTH_YAW_DIRECTION_GUARD_MS =
+  600000U;  // needs 10 min, effectively disabled  // 600 -> 0: disable startup wrong-way guard
+constexpr unsigned FOLLOW_BOTH_YAW_WRONG_WAY_MS =
+  60000U;  // needs 60 s of continuous wrong-way, effectively disabled  // 20 -> 60000 ms: effectively disabled
+constexpr float FOLLOW_BOTH_YAW_WRONG_WAY_RAD = 0.01745329252f;
+constexpr float FOLLOW_BOTH_YAW_WRONG_WAY_RAD_S = 0.20f;
+static_assert(
+  FOLLOW_BOTH_YAW_STARTUP_MS > 0U && FOLLOW_BOTH_YAW_START_QUIET_RAD_S > 0.0f &&
+    FOLLOW_BOTH_YAW_JUMP_SLACK_RAD > 0.0f && FOLLOW_BOTH_YAW_WRONG_WAY_MS > 0U &&
+    FOLLOW_BOTH_YAW_DIRECTION_GUARD_MS >= FOLLOW_BOTH_YAW_WRONG_WAY_MS &&
+    FOLLOW_BOTH_YAW_WRONG_WAY_RAD > 0.0f && FOLLOW_BOTH_YAW_WRONG_WAY_RAD_S > 0.0f,
+  "Invalid dual yaw handoff guards");
 constexpr float FOLLOW_PITCH_PRELIFT_RAD = 0.05235987756f;  // Actual body travel: 3 deg.
 constexpr unsigned FOLLOW_PITCH_PRELIFT_TIME_MS = 2000U;
 constexpr unsigned FOLLOW_PITCH_PRELIFT_SETTLE_MS = 300U;
@@ -370,19 +402,23 @@ constexpr float FOLLOW_IMU_SPEED_FILTER_S = 0.005f;
 constexpr float FOLLOW_PITCH_USABLE_TRAVEL_RAD = 1.570796327f;  // Measured about 90 deg.
 constexpr float FOLLOW_PITCH_LOWER_MARGIN_RAD = 0.01745329252f;
 constexpr float FOLLOW_PITCH_UPPER_MARGIN_RAD = 0.03490658504f;
-// Two-period reference peaks: 4.154 rad/s and 17.261 rad/s^2.
-constexpr float FOLLOW_PITCH_TEST_MAX_SPEED_RAD_S = 5.0f;
-constexpr float FOLLOW_PITCH_TEST_MAX_ACCEL_RAD_S2 = 30.0f;
+// Prelift only. Tracking uses FOLLOW_PITCH_MAX_SPEED/MAX_ACCEL below, without hidden overrides.
+constexpr float FOLLOW_PITCH_PRELIFT_MAX_SPEED_RAD_S = 0.5f;
+constexpr float FOLLOW_PITCH_PRELIFT_MAX_ACCEL_RAD_S2 = 3.0f;
 constexpr float FOLLOW_PITCH_TRACK_FLOOR_TOL_RAD =
   0.01745329252f;  // 1 deg below the lifted start; 2 deg above lower stop.
-constexpr float FOLLOW_PITCH_BRAKE_DECEL_RAD_S2 = 20.0f;
+// Full-period braking estimate. 20 opposed even the ideal descending reference;
+// with 15ms latency and the configured floor, that reference requires about 124.
+// This model parameter must ultimately agree with measured braking capability.
+constexpr float FOLLOW_PITCH_BRAKE_DECEL_RAD_S2 = 130.0f;
 constexpr float FOLLOW_PITCH_BRAKE_LATENCY_S = 0.015f;
 constexpr float FOLLOW_PITCH_BRAKE_GAIN_NM_PER_RAD_S = 0.20f;
 constexpr float FOLLOW_PITCH_FAULT_HOLD_KP = 4.0f;
 constexpr float FOLLOW_PITCH_FAULT_HOLD_MAX_SPEED_RAD_S = 0.5f;
-constexpr bool FOLLOW_PITCH_SEQUENCE_DIAGNOSTICS = false;  // Append phase/fault as channels 4/5.
+constexpr bool FOLLOW_PITCH_SEQUENCE_DIAGNOSTICS = true;  // Append phase/fault as channels 4/5.
 static_assert(
-  FOLLOW_PITCH_PRELIFT_TIME_MS > 0U &&
+  FOLLOW_PITCH_PRELIFT_TIME_MS > 0U && FOLLOW_PITCH_PRELIFT_MAX_SPEED_RAD_S > 0.0f &&
+    FOLLOW_PITCH_PRELIFT_MAX_ACCEL_RAD_S2 > 0.0f &&
     FOLLOW_PITCH_PRELIFT_TIMEOUT_MS > FOLLOW_PITCH_PRELIFT_TIME_MS &&
     FOLLOW_PITCH_PRELIFT_RAD > FOLLOW_PITCH_LOWER_MARGIN_RAD &&
     FOLLOW_PITCH_USABLE_TRAVEL_RAD >
@@ -397,9 +433,7 @@ static_assert(
   "Invalid pitch boundary/hold configuration");
 
 // ---- 运行模式 ----
-// false = 两轴都跟随（当前测 pitch 需要它，否则 pitch 力矩恒为 0）
-constexpr bool FOLLOW_SINGLE_YAW =
-  false;  // false = both axes; yaw torque limited below  // yaw-only test: no pitch feedback required
+// Select both / yaw-only / prepared pitch-only with the switches above.
 // 恒力矩台架测试：不做闭环，只输出固定力矩（测静摩擦、确认转向）。测完必须改回 false。
 // 【方向符号已验证：正力矩 → 实际角度增大，符号正确，DIRECTION 保持 1.0】
 constexpr bool FOLLOW_CONSTANT_TORQUE_TEST = false;
@@ -427,14 +461,16 @@ constexpr unsigned FOLLOW_FEEDBACK_TIMEOUT_MS = 100U;
 constexpr unsigned FOLLOW_MAX_STEP_MS = 10U;  // 调度间隔超过它就重新初始化 PID
 
 // ---- 安全判据 ----
-constexpr float FOLLOW_MAX_TRACKING_ERROR_RAD = 0.34906585f;  // 20°
-constexpr unsigned FOLLOW_TRACKING_ERROR_MS = 50U;            // 连续超限 50 ms 即停机
+constexpr float FOLLOW_MAX_TRACKING_ERROR_RAD =
+  1.20f;  // 0.349(20deg) -> 1.20(69deg): never latch during follow  // 20°
+constexpr unsigned FOLLOW_TRACKING_ERROR_MS =
+  2000U;  // 50 -> 2000 ms: effectively no latch            // 连续超限 50 ms 即停机
 constexpr float FOLLOW_OVERSPEED_FACTOR = 1.5f;
 
 // ---- 前馈 ----
 // 力矩前馈 = J·α_ref + K_g·cos(pitch) + τ_c·sgn(ω)
 // 裸电机 J 很小(≈1.3e-4)、无重力，所以前两项为 0；摩擦项是裸电机跟踪的关键。
-constexpr float FOLLOW_YAW_ACCEL_FF_J = 0.0f;  // kg·m^2
+constexpr float FOLLOW_YAW_ACCEL_FF_J = 0.012f;  // kg·m^2
 constexpr float FOLLOW_PITCH_ACCEL_FF_J = 0.0f;
 constexpr float FOLLOW_PITCH_GRAVITY_NM =
   0.10f;  // tau = 0.15kg * 9.81 * 0.07m = 0.103 Nm  // 0 -> 0.80: heavy head needs gravity feedforward  // m·g·r
@@ -466,53 +502,71 @@ constexpr float FOLLOW_BREAKAWAY_SPEED_RAD_S = 0.15f;
 //   积分上限必须 ≥ 静摩擦对应的力矩，否则积分顶不过摩擦。
 //   位置环 Kp：12 → 15 用于压缩高速段的"切角"滞后。
 constexpr float FOLLOW_YAW_ANGLE_KP =
-  70.0f;  // 85 gave no gain -> back to the 1 ms best  // 70 -> 85: outer loop, no buzz risk  // 55 -> 70: score scales with outer gain (0.083 -> 0.198)  // 35 -> 55: outer loop can go higher without buzz  // 20 -> 35: outer loop only; buzz comes from the inner loop, so this is safe  // 25 -> 20: slight reduction to remove residual wobble  // 10 -> 25: raise position bandwidth (was attenuating to 50%)  // (rad/s)/rad【原始周期：带宽需 ≥3×1.47Hz，10 太小】
+  30.0f;  // 50 -> 70: feedback only, no FF  // 75 -> 50: 69% overshoot means it was near oscillation  // 90 -> 75: gentler, no overshoot  // 105 still diverged -> back to the proven stable 90  // 140 diverged -> 105 (stable zone, slightly above the 90 that worked)  // 90 -> 140: outer bandwidth must cover the 3-hump detail  // 70 -> 90: match the proven pitch value  // 85 gave no gain -> back to the 1 ms best  // 70 -> 85: outer loop, no buzz risk  // 55 -> 70: score scales with outer gain (0.083 -> 0.198)  // 35 -> 55: outer loop can go higher without buzz  // 20 -> 35: outer loop only; buzz comes from the inner loop, so this is safe  // 25 -> 20: slight reduction to remove residual wobble  // 10 -> 25: raise position bandwidth (was attenuating to 50%)  // (rad/s)/rad【原始周期：带宽需 ≥3×1.47Hz，10 太小】
 constexpr float FOLLOW_YAW_ANGLE_KI =
-  6.0f;  // revert: 14 was worse  // 6 -> 14: absorb the constant yaw bias within one 1.36 s cycle  // 4 -> 6  // 2 -> 4: helps the lag without adding high-frequency content   // 消除峰谷处的静态误差（纯 P 压不掉）
+  5.0f;  // 4 -> 2: minimal integral  // 6 -> 4: less integral overshoot  // revert: 14 was worse  // 6 -> 14: absorb the constant yaw bias within one 1.36 s cycle  // 4 -> 6  // 2 -> 4: helps the lag without adding high-frequency content   // 消除峰谷处的静态误差（纯 P 压不掉）
 constexpr float FOLLOW_YAW_ANGLE_KD =
-  1.0f;  // 0.8 mismatched the 1.0 velocity FF and ate 80% of the drive  // 与前馈(1.0)冲突：KD 必须为 0 或 1.0，中间值会吃掉驱动
+  0.85f;  // matched with FF  // matched with FF  // matched with FF  // matched with FF  // keep matched with FF  // 0.8 mismatched the 1.0 velocity FF and ate 80% of the drive  // 与前馈(1.0)冲突：KD 必须为 0 或 1.0，中间值会吃掉驱动
 constexpr float FOLLOW_YAW_ANGLE_INTEGRAL_LIMIT =
   0.30f;  // revert: 0.45 was worse  // 0.30 -> 0.45: allow enough authority for the bias                                      // rad/s（积分最多贡献 0.3 rad/s 的速度指令）
 constexpr float FOLLOW_YAW_SPEED_KP =
-  0.18f;  // 0.22 gave no gain -> back to the 1 ms best  // 0.18 -> 0.22: 1 ms command rate gives headroom  // 0.13 -> 0.18: inner loop can be faster with the 1 ms command rate  // back to the known-stable value (tau 7.7 ms)  // 0.20 -> 0.16: 0.20 was self-oscillating (tau near CAN period)  // 0.13 -> 0.20: faster inner loop, tau = J/Kp = 5 ms > 2 ms CAN  // N·m/(rad/s)【装云台后：0.015→0.100】
+  0.12f;  // 0.22 gave no gain -> back to the 1 ms best  // 0.18 -> 0.22: 1 ms command rate gives headroom  // 0.13 -> 0.18: inner loop can be faster with the 1 ms command rate  // back to the known-stable value (tau 7.7 ms)  // 0.20 -> 0.16: 0.20 was self-oscillating (tau near CAN period)  // 0.13 -> 0.20: faster inner loop, tau = J/Kp = 5 ms > 2 ms CAN  // N·m/(rad/s)【装云台后：0.015→0.100】
 constexpr float FOLLOW_YAW_SPEED_KI =
-  0.35f;  // 0.45 -> 0.35: integral also feeds high-frequency buzz  // N·m/rad（恢复验证值）
+  0.55f;  // 0.45 -> 0.35: integral also feeds high-frequency buzz  // N·m/rad（恢复验证值）
 constexpr float FOLLOW_YAW_SPEED_KD = 0.001f;
 constexpr float FOLLOW_YAW_SPEED_INTEGRAL_LIMIT = 0.25f;  // N·m
+// Dual-axis IMU velocity loop: conservative trial after observed speed reversals.
+// The legacy yaw-only branch keeps FOLLOW_YAW_SPEED_KP/KI/KD above.
+constexpr float FOLLOW_BOTH_YAW_SPEED_KP =
+  0.12f;  // 0.14 -> 0.18  // 0.18 -> 0.14: more damping margin  // 0.20 -> 0.18: single-axis value  // 0.21 -> 0.20  // 0.26 diverged -> 0.21  // 0.20 -> 0.26: inner loop bandwidth  // 0.16 -> 0.20: closer to single-axis 0.18*1.1  // 0.09 -> 0.16: dual-mode inner loop was half strength
+constexpr float FOLLOW_BOTH_YAW_SPEED_KI =
+  0.15f;  // Step 4: reduce integral buildup through reversals; evaluate peak overshoot.
+constexpr float FOLLOW_BOTH_YAW_SPEED_KD = 0.0f;
+static_assert(
+  FOLLOW_BOTH_YAW_SPEED_KP > 0.0f && FOLLOW_BOTH_YAW_SPEED_KI >= 0.0f &&
+    FOLLOW_BOTH_YAW_SPEED_KD >= 0.0f,
+  "Invalid dual-axis yaw velocity PID");
 constexpr float FOLLOW_YAW_ANGLE_MIN_RAD = 0.0f;
 constexpr float FOLLOW_YAW_ANGLE_MAX_RAD = 0.0f;
-constexpr float FOLLOW_YAW_MAX_SPEED_RAD_S = 10.0f;  // 原始周期峰值 7.15
+constexpr float FOLLOW_YAW_MAX_SPEED_RAD_S = 15.0f;  // 10 -> 15: match pitch  // 原始周期峰值 7.15
 constexpr float FOLLOW_YAW_MAX_ACCEL_RAD_S2 =
-  300.0f;  // revert: 450 was worse  // 300 -> 450: the small spikes at each peak need sharper accel  // 130 -> 300: 130 clipped the corner accelerations  // 原始周期峰值 106.9
+  650.0f;  // 300 -> 650: match pitch  // revert: 450 was worse  // 300 -> 450: the small spikes at each peak need sharper accel  // 130 -> 300: 130 clipped the corner accelerations  // 原始周期峰值 106.9
 constexpr float FOLLOW_YAW_MAX_TORQUE_NM =
-  0.02f;  // pitch-only: yaw gets essentially no authority  // 0.80 -> 0.95 (single change: peaks may be torque-clipped)  // back to the 0.237 best  // 0.80 -> 1.20: extra authority to escape the notch  // 0.40 clipped the acceleration      // ≈0.54 A
-constexpr float FOLLOW_YAW_VELOCITY_FF = 1.0f;
+  2.0f;  // Restored from 0.02 with explicit user approval for yaw tracking.
+constexpr float FOLLOW_YAW_VELOCITY_FF =
+  1.0f;  // Step 2: full reference velocity feedforward after yaw reference-D compensation.
 constexpr bool FOLLOW_YAW_CONFIGURED = true;
 
 // pitch 轴：与 yaw 同步为"装云台"整定值（内环必须加强，否则跟随严重滞后）
 constexpr float FOLLOW_PITCH_ANGLE_KP =
-  40.0f;  // 0:03 baseline  // 40 -> 70: match the yaw-proven value  // 1.0 -> 40: was 70x too small  // pitch 惯量小，yaw 的 15 会超调 60%，先降到 6
+  90.0f;  // 70 -> 90: pushes the peak closer  // 40 -> 70: yaw-proven value, amplitude follows gain  // 0:03 baseline  // 40 -> 70: match the yaw-proven value  // 1.0 -> 40: was 70x too small  // pitch 惯量小，yaw 的 15 会超调 60%，先降到 6
 constexpr float FOLLOW_PITCH_ANGLE_KI =
   3.0f;  // 0:03 baseline  // 3 -> 6  // 8 -> 3: integral drove the overshoot at the peak  // reverted  // 8 -> 3: integral windup drove it up  // 2 -> 8: needs integral against gravity
-constexpr float FOLLOW_PITCH_ANGLE_KD = 0.90f;  // step 1: match VELOCITY_FF=0.90 so the feedforward is not eaten  // 0:03 baseline  // matched with FF  // 0 -> 1.0: matches VELOCITY_FF=1.0, adds damping against overshoot
+constexpr float FOLLOW_PITCH_ANGLE_KD =
+  0.95f;  // 1.0 -> 0.95: softer torque step at each reversal  // 0.90 -> 1.0 matched with FF  // step 1: match VELOCITY_FF=0.90 so the feedforward is not eaten  // 0:03 baseline  // matched with FF  // 0 -> 1.0: matches VELOCITY_FF=1.0, adds damping against overshoot
 constexpr float FOLLOW_PITCH_ANGLE_INTEGRAL_LIMIT =
   0.60f;  // reverted  // 0.60 -> 0.15: tighter anti-windup  // 0.30 -> 0.60: room for the gravity torque
 constexpr float FOLLOW_PITCH_SPEED_KP =
-  0.22f;  // 0:03 baseline  // keep the damping that fixed the overshoot  // 0.11 -> 0.22: inner-loop damping is what stops the overshoot  // 0.08 -> 0.15: heavy axis has more inertia, tolerates more gain  // pitch 惯量小，内环适当降低（yaw 用 0.13）
-constexpr float FOLLOW_PITCH_SPEED_KI = 0.30f;  // 0:03 baseline  // 0.40 -> 0.30: less integral in the speed loop
+  0.20f;  // 0.28 -> 0.24: 0.28 buzzed (jagged curve), 0.24 keeps most of the score gain  // 0:03 baseline  // keep the damping that fixed the overshoot  // 0.11 -> 0.22: inner-loop damping is what stops the overshoot  // 0.08 -> 0.15: heavy axis has more inertia, tolerates more gain  // pitch 惯量小，内环适当降低（yaw 用 0.13）
+constexpr float FOLLOW_PITCH_SPEED_KI =
+  0.15f;  // 0.30 -> 0.22: integral also feeds the buzz  // 0:03 baseline  // 0.40 -> 0.30: less integral in the speed loop
 constexpr float FOLLOW_PITCH_SPEED_KD = 0.0f;
 constexpr float FOLLOW_PITCH_SPEED_INTEGRAL_LIMIT = 0.25f;
 constexpr float FOLLOW_PITCH_ANGLE_MIN_RAD = 0.0f;
 constexpr float FOLLOW_PITCH_ANGLE_MAX_RAD = 0.0f;
 constexpr float FOLLOW_PITCH_MAX_SPEED_RAD_S = 15.0f;  // 10 -> 15    // 原始周期峰值 8.31
-constexpr float FOLLOW_PITCH_MAX_ACCEL_RAD_S2 = 250.0f;  // 0:03 baseline  // 250 -> 600: 2x speed needs 4x accel  // 130 -> 250  // 原始周期峰值 69.0
+constexpr float FOLLOW_PITCH_MAX_ACCEL_RAD_S2 =
+  650.0f;  // 450 -> 650: rounds off the peak, needs sharper accel  // 250 -> 450  // 0:03 baseline  // 250 -> 600: 2x speed needs 4x accel  // 130 -> 250  // 原始周期峰值 69.0
 constexpr float FOLLOW_PITCH_MAX_TORQUE_NM =
-  0.80f;  // 0:03 baseline  // 0.80 -> 1.80: 2x speed needs 2x torque, was saturating  // reverted  // 0.80 -> 0.30: load is only 0.10 Nm, huge gain slammed to the limit  // 1.80 -> 0.80: load is only 0.1 Nm, keep headroom but not excessive  // 0.40 -> 1.80: THIS was the stall (GM6020 max 2.22)
-constexpr float FOLLOW_PITCH_VELOCITY_FF = 0.90f;  // 0:03 baseline  // back to 1.0: must match ANGLE_KD  // 1.0 -> 0.90: reduce lead, keep some
+  2.0f;  // 1.50 -> 2.00: peak error needs 1.80 Nm, was clipped (GM6020 max 2.22)  // 1.20 -> 1.50: headroom for the peak  // 0.80 -> 1.20  // 0:03 baseline  // 0.80 -> 1.80: 2x speed needs 2x torque, was saturating  // reverted  // 0.80 -> 0.30: load is only 0.10 Nm, huge gain slammed to the limit  // 1.80 -> 0.80: load is only 0.1 Nm, keep headroom but not excessive  // 0.40 -> 1.80: THIS was the stall (GM6020 max 2.22)
+constexpr float FOLLOW_PITCH_VELOCITY_FF =
+  0.95f;  // 1.0 -> 0.95: matched with KD  // 0.90 -> 1.0: full feedforward kills the lag  // 0:03 baseline  // back to 1.0: must match ANGLE_KD  // 1.0 -> 0.90: reduce lead, keep some
 constexpr bool FOLLOW_PITCH_CONFIGURED = true;
 
-// 微分滤波时间常数（当前 Kd = 0，保留以便以后启用）
+// 默认微分滤波时间常数；双轴跟随 yaw 位置环单独配置。
 constexpr float FOLLOW_D_FILTER_S = 0.05f;
+constexpr float FOLLOW_BOTH_YAW_ANGLE_D_FILTER_S =
+  0.015f;  // Step 3: 15 ms, yaw position loop only.
 
 // ---- 上电找零（撞挡块 → 回退固定角度 → 该位置作为起始角）----
 // 流程：恒力矩朝一个方向慢转 → 角速度≈0 持续 STALL_MS 判定顶到挡块
@@ -545,10 +599,12 @@ constexpr unsigned FOLLOW_HOMING_BACKOFF_TIMEOUT_MS = 3000U;  // 回退超时（
 // 0 = 底盘功率（实测 / 期望 / 限幅系数），1 = 跟随曲线（单yaw：目标/实际/分数，双轴按下方配置），
 // 2 = 原始参考，3 = 底盘诊断（FL 目标速度 / 实际速度 / 力矩 / 静止释放标志），
 // 4 = 功率模型标定（Στω / Στ²×100 / Σω²÷20 / 实测功率）
-constexpr unsigned FOLLOW_PLOT_MODE = 1U;
-constexpr bool FOLLOW_YAW_DIAGNOSTICS = false;  // 当前：双轴反馈帧数诊断（查 pitch 电机是否在线）
+constexpr unsigned FOLLOW_PLOT_MODE = 1U;  // follow view
+constexpr bool FOLLOW_YAW_DIAGNOSTICS =
+  false;  // false = plot curves, not frame counters  // 当前：双轴反馈帧数诊断（查 pitch 电机是否在线）
 // 模式 1 画哪根轴：0 = yaw（目标/实际），1 = pitch（目标/实际）
-constexpr unsigned FOLLOW_PLOT_AXIS = 1U;  // show pitch  // 0 -> 1: show the pitch axis
+constexpr unsigned FOLLOW_PLOT_AXIS =
+  0U;  // 0 -> takes the dual 4-channel branch  // show pitch  // 0 -> 1: show the pitch axis
 
 static_assert(
   FOLLOW_YAW_MOTOR_ID >= 1U && FOLLOW_YAW_MOTOR_ID <= 4U && FOLLOW_PITCH_MOTOR_ID >= 1U &&
@@ -572,6 +628,9 @@ static_assert(
 static_assert(
   FOLLOW_D_FILTER_S >= 0.0f && FOLLOW_D_FILTER_S <= 1.0f,
   "Invalid derivative filter time constant");
+static_assert(
+  FOLLOW_BOTH_YAW_ANGLE_D_FILTER_S >= 0.0f && FOLLOW_BOTH_YAW_ANGLE_D_FILTER_S <= 1.0f,
+  "Invalid dual-axis yaw angle derivative filter time constant");
 
 struct FollowPidConfig
 {

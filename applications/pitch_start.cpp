@@ -18,19 +18,26 @@ namespace
 {
 namespace c = control_constants;
 static_assert(configTICK_RATE_HZ == 1000, "Homing requires 1ms ticks");
+static_assert(
+  !c::FOLLOW_BOTH_ENABLE ||
+    (c::HOME_PITCH_ID == c::FOLLOW_PITCH_MOTOR_ID && c::HOME_PITCH_RATIO == c::FOLLOW_PITCH_RATIO),
+  "Dual tracking must use the same pitch motor and ratio as preparation");
 sp::RM_Motor pitch(c::HOME_PITCH_ID, sp::RM_Motors::GM6020, c::HOME_PITCH_RATIO);
+sp::RM_Motor yaw(c::FOLLOW_YAW_MOTOR_ID, sp::RM_Motors::GM6020, c::FOLLOW_YAW_RATIO);
 sp::RM_Motor m2006(c::HOME_M2006_ID, sp::RM_Motors::M2006, c::HOME_M2006_RATIO);
 Status latest = {};
 // Completion notifies once; the endpoint controller keeps running afterwards.
 bool finished = false;
 uint32_t pitch_stamp = 0, m_stamp = 0, pitch_rx = 0, m_rx = 0, tx_errors = 0;
 float pitch_request = 0.0f, m_request = 0.0f;
+CanDiagnostics can_diagnostics = {};
 uint32_t command_stamp = 0, last_tx = 0;
 bool follow_pitch_claimed = false;
 float follow_pitch_torque = 0.0f;
+float follow_yaw_torque = 0.0f;
 uint32_t follow_pitch_stamp = 0, last_m_tx = 0;
 bool m_sent_once = false;
-bool sent_once = false, start_requested = c::PITCH_START_ENABLED, stop_requested = false;
+bool sent_once = false, start_requested = c::PITCH_START_SELECTED, stop_requested = false;
 float clamp(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 struct PI
 {
@@ -47,8 +54,8 @@ struct PI
 };
 // Physical mechanism travel is measured by the IMU attached to the moving arm.
 // One M2006-driven lift to the selected IMU travel, then persistent endpoint hold.
-constexpr float PITCH_START_BODY_TRAVEL_RAD = 1.2f;
-constexpr uint32_t PITCH_START_IMU_READY_TIMEOUT_MS = 20000U;
+constexpr float PITCH_START_BODY_TRAVEL_RAD = 1.1f;
+constexpr uint32_t PITCH_START_IMU_READY_TIMEOUT_MS = 30000U;
 constexpr float PITCH_START_MIN_IMU_SEEK_RAD = 0.01745329252f;  // 1 degree to learn direction.
 
 // Dedicated pitch_start endpoint hold. These angles are M2006 output-shaft rad.
@@ -57,7 +64,8 @@ constexpr float PITCH_START_MIN_IMU_SEEK_RAD = 0.01745329252f;  // 1 degree to l
 constexpr float END_HOLD_MAX_TORQUE_NM = 1.0f;
 constexpr float END_HOLD_KP = 60.0f;  // Nm/rad: displacement resistance.
 constexpr float END_HOLD_KI = 15.0f;  // Nm/(rad*s): slow load learning avoids stiction hunting.
-constexpr float END_HOLD_KD = 0.4f;   // Nm/(rad/s): motion damping.
+constexpr float END_HOLD_KD =
+  0.42f;  // Nm/(rad/s): damping trial; keep position stiffness and torque limit.
 constexpr float END_HOLD_SPEED_FILTER_S = 0.002f;
 // MOTOR OUTPUT-SHAFT tolerance, not the IMU body angle (~0.086 degree).
 constexpr float END_HOLD_POSITION_TOL_RAD = 0.0015f;
@@ -247,7 +255,10 @@ struct Controller
     // 超速判据加 50 ms 去抖：硬挡块撞击或连杆耦合会产生单帧差分尖峰，
     // 单帧即停机会把"正常撞击"误判成超速。
     constexpr uint32_t kOverspeedDebounceMs = 50U;
-    if (std::fabs(f.ps) > c::HOME_OVERSPEED_RAD_S) {
+    // After takeover, the IMU follower owns the GM6020 speed guard. Applying
+    // the 8rad/s seeking limit here would stop a valid 8.31rad/s reference and
+    // release M2006 as a side effect. M2006's independent guard stays active.
+    if (!f.external_pitch_control && std::fabs(f.ps) > c::HOME_OVERSPEED_RAD_S) {
       if (!pitch_os_since) pitch_os_since = now;
     }
     else
@@ -375,8 +386,12 @@ struct Controller
 };
 bool submit(uint32_t id, uint8_t * data)
 {
+  // Serialize the two task callers only around nonblocking CAN register access.
+  // No HAL timeout or wait is executed with interrupts masked.
+  taskENTER_CRITICAL();
   if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) == 0) {
     ++tx_errors;
+    taskEXIT_CRITICAL();
     return false;
   }
   CAN_TxHeaderTypeDef h = {};
@@ -387,13 +402,68 @@ bool submit(uint32_t id, uint8_t * data)
   uint32_t mailbox = 0;
   if (HAL_CAN_AddTxMessage(&hcan1, &h, data, &mailbox) != HAL_OK) {
     ++tx_errors;
+    taskEXIT_CRITICAL();
     return false;
   }
+  taskEXIT_CRITICAL();
   return true;
+}
+constexpr uint8_t startup_missing_inputs(
+  bool pitch_ready, bool m2006_ready, bool imu_ready, bool angle_valid)
+{
+  return (pitch_ready ? 0U : 1U) | (m2006_ready ? 0U : 2U) | (imu_ready ? 0U : 4U) |
+         (angle_valid ? 0U : 8U);
+}
+constexpr bool follow_command_ready(
+  const Status & owner, bool stopped, uint32_t computed_at, uint32_t current)
+{
+  return owner.stage == Stage::Done && owner.homed && owner.m2006_locked && owner.feedback_fresh &&
+         owner.fault == Fault::None && !stopped &&
+         current - owner.stamp_ms < c::HOME_COMMAND_TIMEOUT_MS &&
+         current - computed_at < c::FOLLOW_COMMAND_TIMEOUT_MS;
+}
+bool send_gm_frame(float yaw_torque, float pitch_torque, uint32_t now, bool following)
+{
+  taskENTER_CRITICAL();
+  now = xTaskGetTickCount();  // Current while locked; owner may have advanced since PID began.
+  const uint32_t interval = following ? c::FOLLOW_CAN_TX_INTERVAL_MS : c::HOME_CAN_INTERVAL_MS;
+  if (sent_once && now - last_tx < interval) {
+    taskEXIT_CRITICAL();
+    return false;
+  }
+  if (
+    following && (!follow_pitch_claimed ||
+                  !follow_command_ready(latest, stop_requested, follow_pitch_stamp, now))) {
+    yaw_torque = pitch_torque = 0.0f;
+  }
+  uint8_t data[8] = {};
+  pitch.cmd(pitch_torque);
+  pitch.write(data);
+  if (c::FOLLOW_BOTH_ENABLE) {
+    yaw.cmd(yaw_torque);
+    yaw.write(data);
+  }
+  const bool queued = submit(pitch.tx_id, data);
+  if (queued) {
+    if (following) {
+      if (
+        can_diagnostics.follow_frames &&
+        now - can_diagnostics.last_tx_ms > can_diagnostics.max_gap_ms)
+        can_diagnostics.max_gap_ms = now - can_diagnostics.last_tx_ms;
+      ++can_diagnostics.follow_frames;
+    }
+    can_diagnostics.last_tx_ms = now;
+    can_diagnostics.last_yaw_torque_nm = c::FOLLOW_BOTH_ENABLE ? yaw_torque : 0.0f;
+    can_diagnostics.last_pitch_torque_nm = pitch_torque;
+    last_tx = now;
+    sent_once = true;
+  }
+  taskEXIT_CRITICAL();
+  return queued;
 }
 }  // namespace
 // Standalone selection; neither enabled nor started by homing.
-bool selected() { return c::PITCH_START_ENABLED; }
+bool selected() { return c::PITCH_START_SELECTED; }
 void start()
 {
   taskENTER_CRITICAL();
@@ -401,6 +471,7 @@ void start()
   stop_requested = false;
   follow_pitch_claimed = false;
   follow_pitch_torque = 0.0f;
+  follow_yaw_torque = 0.0f;
   taskEXIT_CRITICAL();
 }
 void cancel()
@@ -409,6 +480,7 @@ void cancel()
   finished = false;
   follow_pitch_claimed = false;
   follow_pitch_torque = 0.0f;
+  follow_yaw_torque = 0.0f;
   stop_requested = true;
   start_requested = false;
   pitch_request = m_request = 0.0f;
@@ -416,28 +488,60 @@ void cancel()
 }
 Status snapshot()
 {
+  Status s;
+  snapshot(s);
+  return s;
+}
+void snapshot(Status & s)
+{
   taskENTER_CRITICAL();
-  Status s = latest;
+  s = latest;
   s.pitch_rx_frames = pitch_rx;
   s.m2006_rx_frames = m_rx;
   s.tx_errors = tx_errors;
   taskEXIT_CRITICAL();
-  return s;
+}
+void read_can_diagnostics(CanDiagnostics & out)
+{
+  taskENTER_CRITICAL();
+  out = can_diagnostics;
+  out.errors = tx_errors;
+  taskEXIT_CRITICAL();
 }
 bool submit_pitch_follow_torque(float torque_nm, uint32_t now_ms)
 {
-  if (!c::FOLLOW_PITCH_SEQUENCE_ENABLED || !selected() || !std::isfinite(torque_nm)) return false;
+  return submit_follow_torques(0.0f, torque_nm, now_ms);
+}
+bool submit_follow_torques(float yaw_torque_nm, float pitch_torque_nm, uint32_t now_ms)
+{
+  if (
+    !c::FOLLOW_PITCH_SEQUENCE_ENABLED || !selected() || !std::isfinite(yaw_torque_nm) ||
+    !std::isfinite(pitch_torque_nm) || (!c::FOLLOW_BOTH_ENABLE && yaw_torque_nm != 0.0f))
+    return false;
   taskENTER_CRITICAL();
-  const bool ready = latest.stage == Stage::Done && latest.homed && latest.m2006_locked &&
-                     latest.feedback_fresh && latest.fault == Fault::None && !stop_requested &&
-                     now_ms - latest.stamp_ms < c::HOME_COMMAND_TIMEOUT_MS;
+  const uint32_t submitted_at = xTaskGetTickCount();
+  const bool ready = follow_command_ready(latest, stop_requested, now_ms, submitted_at);
+  float yt = 0.0f, pt = 0.0f;
   if (ready) {
+    if (!follow_pitch_claimed) {
+      can_diagnostics.follow_frames = 0;
+      can_diagnostics.max_gap_ms = 0;
+    }
     follow_pitch_torque =
-      clamp(torque_nm, -c::FOLLOW_PITCH_MAX_TORQUE_NM, c::FOLLOW_PITCH_MAX_TORQUE_NM);
+      clamp(pitch_torque_nm, -c::FOLLOW_PITCH_MAX_TORQUE_NM, c::FOLLOW_PITCH_MAX_TORQUE_NM);
+    follow_yaw_torque =
+      c::FOLLOW_BOTH_ENABLE
+        ? clamp(yaw_torque_nm, -c::FOLLOW_YAW_MAX_TORQUE_NM, c::FOLLOW_YAW_MAX_TORQUE_NM)
+        : 0.0f;
     follow_pitch_stamp = now_ms;
     follow_pitch_claimed = true;
+    yt = follow_yaw_torque;
+    pt = follow_pitch_torque;
   }
   taskEXIT_CRITICAL();
+  // Queue the newly computed pair in THIS controller cycle, rather than wait
+  // for pitch_start's next 1ms iteration. It remains one shared GM6020 frame.
+  if (ready) (void)send_gm_frame(yt, pt, now_ms, true);
   return ready;
 }
 bool receive_can1(const CAN_RxHeaderTypeDef & h, uint8_t * data, uint32_t now)
@@ -462,21 +566,22 @@ void transmit_can1(uint32_t now)
 {
   if (!selected()) return;
   taskENTER_CRITICAL();
+  now = xTaskGetTickCount();
   const bool fast_pitch = c::FOLLOW_PITCH_SEQUENCE_ENABLED && follow_pitch_claimed;
   const bool live = now - command_stamp < c::HOME_COMMAND_TIMEOUT_MS && !stop_requested;
   const float pt = live ? pitch_request : 0.0f, mt = live ? m_request : 0.0f;
+  const bool follow_fresh = now - follow_pitch_stamp < c::FOLLOW_COMMAND_TIMEOUT_MS;
+  const bool owner_ready =
+    latest.stage == Stage::Done && latest.fault == Fault::None && latest.feedback_fresh;
+  // Fresh following commands are sent directly by submit_follow_torques().
+  // This task retains preparation and the independent zero-command watchdog.
+  if (!live)
+    (void)send_gm_frame(0.0f, 0.0f, now, true);
+  else if (!fast_pitch)
+    (void)send_gm_frame(0.0f, pt, now, false);
+  else if (!follow_fresh || !owner_ready)
+    (void)send_gm_frame(0.0f, 0.0f, now, true);
   taskEXIT_CRITICAL();
-  const uint32_t pitch_period = fast_pitch ? c::FOLLOW_CAN_TX_INTERVAL_MS : c::HOME_CAN_INTERVAL_MS;
-  // Exactly one owner of 0x1FE, with all yaw slots zero in this pitch-only mode.
-  if (!sent_once || now - last_tx >= pitch_period) {
-    uint8_t data[8] = {};
-    pitch.cmd(pt);
-    pitch.write(data);
-    if (submit(pitch.tx_id, data)) {
-      last_tx = now;
-      sent_once = true;
-    }
-  }
   // Keep the proven M2006 5ms holding cadence; faster pitch does not flood this group.
   if (!m_sent_once || now - last_m_tx >= c::HOME_CAN_INTERVAL_MS) {
     uint8_t data[8] = {};
@@ -504,6 +609,13 @@ void run()
     previous = now;
     const auto imu = gimbal_imu::read();  // Snapshot only; grading task owns SPI/update.
     taskENTER_CRITICAL();
+    const uint32_t feedback_now = xTaskGetTickCount();
+    const bool pitch_ready =
+      pitch.is_open() && feedback_now - pitch_stamp < c::HOME_FEEDBACK_TIMEOUT_MS;
+    const bool m2006_ready =
+      m2006.is_open() && feedback_now - m_stamp < c::HOME_FEEDBACK_TIMEOUT_MS;
+    const uint8_t missing_inputs =
+      startup_missing_inputs(pitch_ready, m2006_ready, imu.ready, std::isfinite(imu.raw_pitch_rad));
     const Feedback f = {
       pitch.angle,
       pitch.speed,
@@ -511,13 +623,12 @@ void run()
       m2006.angle,
       m2006.speed,
       m2006.torque,
-      pitch.is_open() && m2006.is_open() && now - pitch_stamp < c::HOME_FEEDBACK_TIMEOUT_MS &&
-        now - m_stamp < c::HOME_FEEDBACK_TIMEOUT_MS,
+      pitch_ready && m2006_ready,
       imu.raw_pitch_rad,
       imu.ready,
       c::FOLLOW_PITCH_SEQUENCE_ENABLED && follow_pitch_claimed};
     const bool external_pitch = c::FOLLOW_PITCH_SEQUENCE_ENABLED && follow_pitch_claimed;
-    const bool external_fresh = now - follow_pitch_stamp < c::FOLLOW_COMMAND_TIMEOUT_MS;
+    const bool external_fresh = feedback_now - follow_pitch_stamp < c::FOLLOW_COMMAND_TIMEOUT_MS;
     const float external_torque = follow_pitch_torque;
     const bool go = start_requested, stop = stop_requested;
     start_requested = false;
@@ -527,11 +638,17 @@ void run()
       ctrl = Controller{};
     else if (go)
       ctrl.begin(now);
+    const bool waiting_on_entry = ctrl.out.stage == Stage::WaitFeedback;
     ctrl.step(f, now, elapsed * 0.001f);
     if (external_pitch && ctrl.out.stage == Stage::Done && ctrl.out.fault == Fault::None)
       ctrl.out.pitch_torque_nm = external_fresh ? external_torque : 0.0f;
     const bool completed = ctrl.out.homed && ctrl.m2006_home_done;
     taskENTER_CRITICAL();
+    // Record the SAME inputs as Controller::step; preserve them after timeout.
+    if (waiting_on_entry)
+      can_diagnostics.waiting_inputs = missing_inputs;
+    else if (ctrl.out.stage != Stage::Fault)
+      can_diagnostics.waiting_inputs = 0;
     latest = ctrl.out;
     pitch_request = ctrl.out.pitch_torque_nm;
     m_request = ctrl.out.m2006_torque_nm;

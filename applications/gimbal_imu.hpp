@@ -11,12 +11,14 @@ struct State {
   float pitch_rad;
   float raw_yaw_rad;             // Fused body attitude, NOT encoder angles.
   float raw_pitch_rad;
+  float world_yaw_rate_rad_s;    // Bias-corrected gyro rotated into world vertical.
   float bias_rad_s[3];
   float acceleration_norm_mps2;
   float max_raw_gyro_rad_s;
   float calibration_std_rad_s;
+  float calibration_rejected_std_rad_s;  // Last rejected noise window; retained across retries.
   uint32_t calibration_elapsed_ms;
-  uint8_t calibration_restart_reason;  // 1 motion, 2 gravity, 3 noise/mean drift, 4 gap.
+  uint8_t calibration_restart_reason;  // 1 motion, 2 gravity, 3 std, 4 gap, 5 block-mean drift.
   uint32_t stamp_ms;
   uint32_t samples;
   uint32_t calibration_samples;
@@ -34,6 +36,7 @@ struct State {
 void begin();
 void update();
 State read();
+void read(State & result);  // Caller-owned buffer avoids a large task-stack temporary.
 bool ready();
 // Called once by trajectory_follow at the SAME initial-pose capture as encoders.
 bool capture_reference(float initial_yaw_rad, float initial_pitch_rad);

@@ -63,11 +63,13 @@ sp::RM_Motor pitch_motor(
 // ---- 共享状态 ----
 Feedback feedback = {};
 Result latest = {};
+SequenceDiagnostics sequence_diagnostics = {};
 TransportStatus transport = {};
-bool enabled = control_constants::FOLLOW_START_ENABLED;
+bool enabled = control_constants::FOLLOW_START_ENABLED || control_constants::FOLLOW_SINGLE_YAW;
 bool capture_requested = false;
 bool initial_pose_captured = false;
-bool startup_capture_allowed = control_constants::FOLLOW_AUTO_CAPTURE_INITIAL_POSE;
+bool startup_capture_allowed = control_constants::FOLLOW_AUTO_CAPTURE_INITIAL_POSE ||
+  control_constants::FOLLOW_SINGLE_YAW;
 float yaw_origin = 0.0f;
 float pitch_origin = 0.0f;
 uint32_t yaw_stamp = 0;
@@ -116,14 +118,19 @@ bool fresh(const AxisFeedback & f, uint32_t now)
          (now - f.stamp_ms) < control_constants::FOLLOW_FEEDBACK_TIMEOUT_MS;
 }
 
-// 微分先行 + 条件积分。target 与 actual 用同一坐标；饱和时停止积分避免积分饱和。
+// 默认微分先行；位置环可传入解析目标速度，形成同一滤波器下的误差微分。
+// target 与 actual 用同一坐标；饱和时停止积分避免积分饱和。
 float pid(
   PidState & state, const FollowPidConfig & config, float target, float actual, float dt,
-  float feedforward, float low, float high, bool & saturated)
+  float feedforward, float low, float high, bool & saturated,
+  float derivative_reference = 0.0f,
+  float derivative_filter_s = control_constants::FOLLOW_D_FILTER_S)
 {
   const float error = target - actual;
-  const float derivative = state.initialized ? -(actual - state.previous_feedback) / dt : 0.0f;
-  const float alpha = dt / (control_constants::FOLLOW_D_FILTER_S + dt);
+  const float feedback_derivative =
+    state.initialized ? -(actual - state.previous_feedback) / dt : 0.0f;
+  const float derivative = derivative_reference + feedback_derivative;
+  const float alpha = dt / (derivative_filter_s + dt);
   state.filtered_derivative += alpha * (derivative - state.filtered_derivative);
   state.previous_feedback = actual;
   state.initialized = true;
@@ -143,7 +150,8 @@ float pid(
 // 单轴：位置环 → 目标转速限幅 → 斜坡 → 速度环（含力矩前馈）→ 力矩限幅
 AxisResult update_axis(
   AxisState & state, const FollowAxisConfig & c, const AxisFeedback & f, float ref_angle,
-  float ref_rate, float ref_acc, float dt, bool physical_bounds = false)
+  float ref_rate, float ref_acc, float dt, bool physical_bounds = false,
+  bool track_reference_derivative = false)
 {
   AxisResult r = {};
   r.target_angle_rad = ref_angle;
@@ -169,9 +177,16 @@ AxisResult update_axis(
   if (bounded && f.angle_rad <= c.angle_min_rad) min_speed = 0.0f;  // 到限位不许继续往外
   if (bounded && f.angle_rad >= c.angle_max_rad) max_speed = 0.0f;
 
+  // 双轴测试的 yaw：Kd * LPF(目标速度 - 反馈角度差分速度)。
+  // 两项共用 yaw 位置环微分滤波器，保留反馈阻尼，避免抵消速度前馈。
+  // 目标角被限幅时，其目标速度为零；pitch 和原单轴分支保持微分先行。
+  const float derivative_reference =
+    track_reference_derivative && !r.angle_limited ? ref_rate : 0.0f;
+  const float angle_derivative_filter_s = track_reference_derivative ?
+    control_constants::FOLLOW_BOTH_YAW_ANGLE_D_FILTER_S : control_constants::FOLLOW_D_FILTER_S;
   r.speed_demand_rad_s =
     pid(state.angle, c.angle_pid, target, f.angle_rad, dt, speed_ff, min_speed, max_speed,
-        r.speed_limited);
+        r.speed_limited, derivative_reference, angle_derivative_filter_s);
 
   // 目标转速斜坡：限制加速度冲击。必须 ≥ 轨迹峰值加速度，否则会压住曲线。
   const float max_change = c.max_accel_rad_s2 * dt;
@@ -341,6 +356,12 @@ Result read()
   taskEXIT_CRITICAL();
   return value;
 }
+void read_sequence_diagnostics(SequenceDiagnostics & out)
+{
+  taskENTER_CRITICAL();
+  out = sequence_diagnostics;
+  taskEXIT_CRITICAL();
+}
 
 void set_enabled(bool value)
 {
@@ -488,17 +509,50 @@ constexpr PitchBoundaryResult pitch_boundary_torque(
 constexpr bool pitch_support_fault(uint8_t fault)
 {
   return fault == FAULT_TRACKING_ERROR || fault == FAULT_OVERSPEED ||
-    fault == FAULT_PRELIFT || fault == FAULT_BOUNDARY;
+    fault == FAULT_PRELIFT || fault == FAULT_BOUNDARY || fault == FAULT_YAW_REFERENCE;
 }
 
-// Optional sequence uses the existing follow task and PID structure. The tested
-// pitch_start task remains the only CAN writer and keeps M2006 position holding.
+constexpr float dual_yaw_authority(uint32_t elapsed_ms) {
+  return elapsed_ms >= control_constants::FOLLOW_BOTH_YAW_STARTUP_MS ? 1.0f :
+    static_cast<float>(elapsed_ms) / control_constants::FOLLOW_BOTH_YAW_STARTUP_MS;
+}
+constexpr bool dual_yaw_step_valid(float delta, float dt) {
+  namespace c = control_constants;
+  const float magnitude = delta < 0.0f ? -delta : delta;
+  return dt > 0.0f && magnitude <=
+    c::FOLLOW_YAW.max_speed_rad_s * c::FOLLOW_OVERSPEED_FACTOR * dt + c::FOLLOW_BOTH_YAW_JUMP_SLACK_RAD;
+}
+constexpr bool dual_yaw_wrong_way(float plan_delta, float actual_delta, float speed) {
+  namespace c = control_constants;
+  return (plan_delta > c::FOLLOW_BOTH_YAW_WRONG_WAY_RAD &&
+      actual_delta < -c::FOLLOW_BOTH_YAW_WRONG_WAY_RAD && speed < -c::FOLLOW_BOTH_YAW_WRONG_WAY_RAD_S) ||
+    (plan_delta < -c::FOLLOW_BOTH_YAW_WRONG_WAY_RAD &&
+      actual_delta > c::FOLLOW_BOTH_YAW_WRONG_WAY_RAD && speed > c::FOLLOW_BOTH_YAW_WRONG_WAY_RAD_S);
+}
+
+// Optional one/two-axis sequence uses the existing follow task and PID structure. The tested
+// pitch_start owns the shared CAN sender and preserves M2006 position holding.
 void run_pitch_sequence()
 {
   namespace c = control_constants;
+  constexpr bool both = c::FOLLOW_BOTH_ENABLE;
   static Result result;  // Keep the existing 256-word task stack; no large reset temporary.
+  static pitch_start::Status prepared;
+  static gimbal_imu::State imu;
+  static SequenceDiagnostics trace = {};
+  static pitch_start::CanDiagnostics fault_can = {};
+  struct YawMotorSample {float angle, speed, torque;};
+  static YawMotorSample motor_sample = {};
+  float yaw_motor_start = 0.0f;
   static FollowAxisConfig pitch_config = c::FOLLOW_PITCH;
   static FollowAxisConfig hold_config = c::FOLLOW_PITCH;
+  static FollowAxisConfig yaw_config = c::FOLLOW_YAW;
+  if (both) {
+    // IMU feedback has a different response from the legacy motor-RPM loop.
+    // Reduce only this inner loop; preserve position gains, limits and timing.
+    yaw_config.speed_pid = {c::FOLLOW_BOTH_YAW_SPEED_KP, c::FOLLOW_BOTH_YAW_SPEED_KI,
+      c::FOLLOW_BOTH_YAW_SPEED_KD, c::FOLLOW_YAW_SPEED_INTEGRAL_LIMIT};
+  }
   const TrajectoryPoint initial = sample_reference(0);
   const float physical_lower = initial.pitch - c::FOLLOW_PITCH_PRELIFT_RAD +
     c::FOLLOW_PITCH_LOWER_MARGIN_RAD;
@@ -507,24 +561,29 @@ void run_pitch_sequence()
     c::FOLLOW_PITCH_LOWER_MARGIN_RAD;
   pitch_config.angle_max_rad = initial.pitch - c::FOLLOW_PITCH_PRELIFT_RAD +
     c::FOLLOW_PITCH_USABLE_TRAVEL_RAD - c::FOLLOW_PITCH_UPPER_MARGIN_RAD;
-  pitch_config.max_speed_rad_s = c::FOLLOW_PITCH_TEST_MAX_SPEED_RAD_S;
-  pitch_config.max_accel_rad_s2 = c::FOLLOW_PITCH_TEST_MAX_ACCEL_RAD_S2;
   hold_config = pitch_config;
   hold_config.angle_pid = {c::FOLLOW_PITCH_FAULT_HOLD_KP, 0.0f, 0.0f, 0.0f};
   hold_config.max_speed_rad_s = c::FOLLOW_PITCH_FAULT_HOLD_MAX_SPEED_RAD_S;
+  hold_config.max_accel_rad_s2 = c::FOLLOW_PITCH_PRELIFT_MAX_ACCEL_RAD_S2;
   hold_config.accel_feedforward_j = 0.0f;
   hold_config.friction_nm = 0.0f;
   const bool config_ok = configured(pitch_config) &&
+    (!both || configured(yaw_config)) &&
     pitch_config.angle_min_rad < initial.pitch &&
     pitch_config.angle_max_rad > -initial.pitch;
   PitchSequencePhase phase = PitchSequencePhase::Waiting;
   uint8_t failure = config_ok ? FAULT_NONE : FAULT_CONFIG;
+  FaultCause cause = config_ok ? FaultCause::None : FaultCause::InvalidOutput;
   uint32_t prelift_start = 0, trajectory_start = 0, settle_since = 0, error_ms = 0;
+  uint32_t yaw_error_ms = 0;
+  uint32_t yaw_wrong_way_ms = 0;
   uint32_t speed_stamp = 0;
   float previous_raw_pitch = 0.0f, filtered_raw_speed = 0.0f, up_sign = 1.0f;
+  float previous_raw_yaw = 0.0f, filtered_raw_yaw_speed = 0.0f;
   bool have_speed = false;
   bool reference_started = false, fault_hold_captured = false;
   float fault_hold_target = 0.0f;
+  bool yaw_feedback_fault = false;
   TickType_t wake = xTaskGetTickCount(), previous = wake;
   constexpr uint32_t period = TRAJECTORY_PERIOD_MS * c::FOLLOW_TRAJECTORY_TIME_SCALE;
   const float missing = std::numeric_limits<float>::quiet_NaN();
@@ -536,28 +595,43 @@ void run_pitch_sequence()
     if (!elapsed) continue;
     previous = now;
     const float dt = elapsed * 0.001f;
-    const auto prepared = pitch_start::snapshot();
-    auto imu = gimbal_imu::read();
+    pitch_start::snapshot(prepared);
+    gimbal_imu::read(imu);
+    if (phase == PitchSequencePhase::Tracking && elapsed > trace.max_step_ms)
+      trace.max_step_ms = elapsed;
+    taskENTER_CRITICAL();
+    const uint32_t feedback_now = xTaskGetTickCount();
+    motor_sample = {yaw_motor.angle, yaw_motor.speed, yaw_motor.torque};
+    const bool yaw_live = !both || (yaw_motor.is_alive(feedback_now) &&
+      feedback_now - yaw_stamp < c::FOLLOW_FEEDBACK_TIMEOUT_MS);
+    taskEXIT_CRITICAL();
     std::memset(&result, 0, sizeof(result));
-    result.pitch_only = true;
+    result.pitch_only = !both;
+    result.prepared_sequence = true;
     result.stamp_ms = now;
+    result.yaw.target_angle_rad = initial.yaw;
     result.pitch.target_angle_rad = initial.pitch;
     if (reference_started) {
       result.trajectory_elapsed_ms = (now - trajectory_start) % period;
-      result.pitch.target_angle_rad = sample_reference(result.trajectory_elapsed_ms).pitch;
+      const TrajectoryPoint planned = sample_reference(result.trajectory_elapsed_ms);
+      result.pitch.target_angle_rad = planned.pitch;
+      result.yaw.target_angle_rad = planned.yaw;
     }
     result.pitch.actual_angle_rad = imu.valid ? imu.pitch_rad : missing;
     result.yaw.actual_angle_rad = imu.valid ? imu.yaw_rad : missing;
     result.configuration_ready = config_ok;
     result.calibrated = imu.valid && phase != PitchSequencePhase::Waiting;
-    result.feedback_fresh = imu.ready && prepared.feedback_fresh &&
-      now - prepared.stamp_ms < c::HOME_COMMAND_TIMEOUT_MS;
+    const bool pitch_feedback_fresh = imu.ready && prepared.feedback_fresh &&
+      feedback_now - prepared.stamp_ms < c::HOME_COMMAND_TIMEOUT_MS;
+    result.feedback_fresh = pitch_feedback_fresh && (!both || !reference_started || yaw_live);
     const bool rc_stop = c::FOLLOW_USE_RC_STOP && g_data.sw_r == 0;
     result.rc_stop = rc_stop;
 
     if (!config_ok) phase = PitchSequencePhase::Fault;
     if (prepared.stage == pitch_start::Stage::Fault) {
+      yaw_feedback_fault = false;
       failure = FAULT_FEEDBACK;
+      cause = FaultCause::Feedback;
       phase = PitchSequencePhase::Fault;
     }
     if (phase == PitchSequencePhase::Waiting && prepared.stage == pitch_start::Stage::Done &&
@@ -567,12 +641,15 @@ void run_pitch_sequence()
           !gimbal_imu::capture_reference(initial.yaw,
             initial.pitch - c::FOLLOW_PITCH_PRELIFT_RAD, up_sign)) {
         failure = FAULT_IMU;
+        cause = FaultCause::Imu;
         phase = PitchSequencePhase::Fault;
       } else {
-        imu = gimbal_imu::read();
+        gimbal_imu::read(imu);
         previous_raw_pitch = imu.raw_pitch_rad;
+        previous_raw_yaw = imu.raw_yaw_rad;
         speed_stamp = imu.stamp_ms;
         filtered_raw_speed = 0.0f;
+        filtered_raw_yaw_speed = 0.0f;
         have_speed = true;
         prelift_start = now;
         phase = PitchSequencePhase::Prelift;
@@ -582,17 +659,23 @@ void run_pitch_sequence()
     }
 
     if (phase == PitchSequencePhase::Prelift || phase == PitchSequencePhase::Tracking) {
-      if (!imu.valid || !std::isfinite(imu.pitch_rad) || !std::isfinite(imu.raw_pitch_rad)) {
+      if (!imu.valid || !std::isfinite(imu.pitch_rad) || !std::isfinite(imu.raw_pitch_rad) ||
+          (both && (!std::isfinite(imu.yaw_rad) || !std::isfinite(imu.raw_yaw_rad)))) {
         failure = FAULT_IMU;
+        cause = FaultCause::Imu;
         phase = PitchSequencePhase::Fault;
       } else if (!result.feedback_fresh || !prepared.homed || !prepared.m2006_locked) {
+        yaw_feedback_fault = both && !yaw_live && pitch_feedback_fresh;
         failure = FAULT_FEEDBACK;
+        cause = FaultCause::Feedback;
         phase = PitchSequencePhase::Fault;
       } else if (elapsed > c::FOLLOW_MAX_STEP_MS) {
         failure = FAULT_TIMING;
+        cause = FaultCause::Timing;
         phase = PitchSequencePhase::Fault;
       } else if (!enabled || rc_stop) {
         failure = FAULT_NONE;
+        cause = FaultCause::Stop;
         phase = PitchSequencePhase::Fault;  // Latched stop; no automatic restart.
       }
     }
@@ -606,17 +689,45 @@ void run_pitch_sequence()
         const float measured = (imu.raw_pitch_rad - previous_raw_pitch) / sensor_dt;
         filtered_raw_speed += sensor_dt / (c::FOLLOW_IMU_SPEED_FILTER_S + sensor_dt) *
           (measured - filtered_raw_speed);
+        if (both) {
+          const float yaw_delta = imu.raw_yaw_rad - previous_raw_yaw;
+          if (!std::isfinite(imu.world_yaw_rate_rad_s) || !dual_yaw_step_valid(yaw_delta,sensor_dt)) {
+            if (phase == PitchSequencePhase::Prelift || phase == PitchSequencePhase::Tracking) {
+              failure = FAULT_YAW_REFERENCE;
+              cause = FaultCause::YawJump;
+              phase = PitchSequencePhase::Fault;
+            }
+            filtered_raw_yaw_speed = 0.0f;
+          } else {
+            // Gyro projected into world vertical: no derivative kick from an
+            // angle-estimator correction and no body-Z/pitch cross coupling.
+            filtered_raw_yaw_speed += sensor_dt / (c::FOLLOW_IMU_SPEED_FILTER_S + sensor_dt) *
+              (imu.world_yaw_rate_rad_s - filtered_raw_yaw_speed);
+          }
+        }
       } else {
         filtered_raw_speed = 0.0f;
+        filtered_raw_yaw_speed = 0.0f;
       }
       previous_raw_pitch = imu.raw_pitch_rad;
+      previous_raw_yaw = imu.raw_yaw_rad;
       speed_stamp = imu.stamp_ms;
       have_speed = true;
     }
     const float speed = up_sign * filtered_raw_speed;
+    float yaw_speed = c::IMU_YAW_DIRECTION * filtered_raw_yaw_speed;
+    const float speed_limit = phase == PitchSequencePhase::Tracking ?
+      c::FOLLOW_PITCH.max_speed_rad_s : c::FOLLOW_PITCH_PRELIFT_MAX_SPEED_RAD_S;
     if ((phase == PitchSequencePhase::Prelift || phase == PitchSequencePhase::Tracking) &&
-        std::fabs(speed) > pitch_config.max_speed_rad_s * c::FOLLOW_OVERSPEED_FACTOR) {
+        std::fabs(speed) > speed_limit * c::FOLLOW_OVERSPEED_FACTOR) {
       failure = FAULT_OVERSPEED;
+      cause = FaultCause::PitchOverspeed;
+      phase = PitchSequencePhase::Fault;
+    }
+    if (both && phase == PitchSequencePhase::Tracking &&
+        std::fabs(yaw_speed) > c::FOLLOW_YAW.max_speed_rad_s * c::FOLLOW_OVERSPEED_FACTOR) {
+      failure = FAULT_OVERSPEED;
+      cause = FaultCause::YawOverspeed;
       phase = PitchSequencePhase::Fault;
     }
 
@@ -628,7 +739,8 @@ void run_pitch_sequence()
         target = prelift_reference(initial, u, seconds, c::FOLLOW_PITCH_PRELIFT_RAD);
         const bool settled = u >= 1.0f &&
           std::fabs(imu.pitch_rad - initial.pitch) <= c::FOLLOW_PITCH_PRELIFT_TOL_RAD &&
-          std::fabs(speed) <= c::FOLLOW_PITCH_PRELIFT_QUIET_RAD_S;
+          std::fabs(speed) <= c::FOLLOW_PITCH_PRELIFT_QUIET_RAD_S &&
+          (!both || (yaw_live && std::fabs(yaw_speed) <= c::FOLLOW_BOTH_YAW_START_QUIET_RAD_S));
         if (!settled) settle_since = 0;
         else if (!settle_since) settle_since = now;
         if (settle_since && now - settle_since >= c::FOLLOW_PITCH_PRELIFT_SETTLE_MS) {
@@ -636,23 +748,41 @@ void run_pitch_sequence()
           // Preserve the velocity-loop load integral through this transition.
           if (!gimbal_imu::capture_reference(initial.yaw, initial.pitch, up_sign)) {
             failure = FAULT_IMU;
+            cause = FaultCause::Imu;
             phase = PitchSequencePhase::Fault;
           } else {
-            imu = gimbal_imu::read();
+            gimbal_imu::read(imu);
             pitch_state.angle = PidState{};
             pitch_state.speed.previous_feedback = speed;
             pitch_state.speed.filtered_derivative = 0.0f;
             pitch_state.speed.initialized = true;
             pitch_state.speed_command = 0.0f;
             pitch_state.ff_direction = 0.0f;
+            if (both) {
+              speed_stamp = imu.stamp_ms;
+              previous_raw_pitch = imu.raw_pitch_rad;
+              previous_raw_yaw = imu.raw_yaw_rad;
+              filtered_raw_yaw_speed = yaw_speed = 0.0f;
+              yaw_motor_start = motor_sample.angle;
+              reset_axis(yaw_state);
+              yaw_state.angle.previous_feedback = imu.yaw_rad;
+              yaw_state.angle.initialized = true;
+              yaw_state.speed.previous_feedback = 0.0f;
+              yaw_state.speed.initialized = true;
+            }
             trajectory_start = now;
             reference_started = true;
             error_ms = 0;
+            yaw_error_ms = 0;
+            yaw_wrong_way_ms = 0;
+            trace.max_step_ms = elapsed;
             phase = PitchSequencePhase::Tracking;
             target = initial;
           }
         } else if (now - prelift_start >= c::FOLLOW_PITCH_PRELIFT_TIMEOUT_MS) {
-          failure = FAULT_PRELIFT;
+          yaw_feedback_fault = both && !yaw_live;
+          failure = yaw_feedback_fault ? FAULT_FEEDBACK : FAULT_PRELIFT;
+          cause = yaw_feedback_fault ? FaultCause::Feedback : FaultCause::Prelift;
           phase = PitchSequencePhase::Fault;
         }
       }
@@ -665,9 +795,21 @@ void run_pitch_sequence()
         // than using a soft bound only one degree above the physical stop.
         pitch_config.angle_min_rad = phase == PitchSequencePhase::Tracking ?
           tracking_lower : physical_lower;
-        const AxisFeedback actual = {imu.pitch_rad, speed, imu.stamp_ms, true};
+        pitch_config.max_speed_rad_s = phase == PitchSequencePhase::Tracking ?
+          c::FOLLOW_PITCH.max_speed_rad_s : c::FOLLOW_PITCH_PRELIFT_MAX_SPEED_RAD_S;
+        pitch_config.max_accel_rad_s2 = phase == PitchSequencePhase::Tracking ?
+          c::FOLLOW_PITCH.max_accel_rad_s2 : c::FOLLOW_PITCH_PRELIFT_MAX_ACCEL_RAD_S2;
+        AxisFeedback actual = {imu.pitch_rad, speed, imu.stamp_ms, true};
         result.pitch = update_axis(pitch_state, pitch_config, actual,
           target.pitch, target.pitch_vel, target.pitch_acc, dt, true);
+        if (both && phase == PitchSequencePhase::Tracking) {
+          actual = {imu.yaw_rad, yaw_speed, imu.stamp_ms, yaw_live};
+          // Limiting inside the PID preserves anti-windup while the original
+          // full yaw torque authority ramps in smoothly.
+          yaw_config.max_output = c::FOLLOW_YAW.max_output * dual_yaw_authority(now - trajectory_start);
+          result.yaw = update_axis(yaw_state, yaw_config, actual,
+            target.yaw, target.yaw_vel, target.yaw_acc, dt, false, true);
+        }
         const auto boundary = pitch_boundary_torque(imu.pitch_rad, speed,
           result.pitch.control_output, pitch_config.angle_min_rad, pitch_config.angle_max_rad);
         result.pitch.control_output = boundary.torque;
@@ -677,38 +819,80 @@ void run_pitch_sequence()
         if (boundary.upper_braking && pitch_state.speed.integral > 0.0f)
           pitch_state.speed.integral = 0.0f;
         result.calibrated = true;
-        result.active = finite_output(result.pitch);
+        result.active = finite_output(result.pitch) &&
+          (!both || phase != PitchSequencePhase::Tracking || finite_output(result.yaw));
         if (phase == PitchSequencePhase::Tracking) {
           error_ms = std::fabs(result.pitch.angle_error_rad) > c::FOLLOW_MAX_TRACKING_ERROR_RAD ?
             error_ms + elapsed : 0;
-          if (error_ms >= c::FOLLOW_TRACKING_ERROR_MS) {
+          yaw_error_ms = both && std::fabs(result.yaw.angle_error_rad) > c::FOLLOW_MAX_TRACKING_ERROR_RAD ?
+            yaw_error_ms + elapsed : 0;
+          if (both && now - trajectory_start < c::FOLLOW_BOTH_YAW_DIRECTION_GUARD_MS &&
+              dual_yaw_wrong_way(target.yaw - initial.yaw, imu.yaw_rad - initial.yaw, yaw_speed))
+            yaw_wrong_way_ms += elapsed;
+          else yaw_wrong_way_ms = 0;
+          if (error_ms >= c::FOLLOW_TRACKING_ERROR_MS || yaw_error_ms >= c::FOLLOW_TRACKING_ERROR_MS) {
             failure = FAULT_TRACKING_ERROR;
+            cause = yaw_error_ms >= c::FOLLOW_TRACKING_ERROR_MS ?
+              FaultCause::YawTracking : FaultCause::PitchTracking;
             phase = PitchSequencePhase::Fault;
           }
           if (imu.pitch_rad < tracking_lower || imu.pitch_rad > pitch_config.angle_max_rad) {
             failure = FAULT_BOUNDARY;
+            cause = FaultCause::Boundary;
+            phase = PitchSequencePhase::Fault;
+          }
+          if (yaw_wrong_way_ms >= c::FOLLOW_BOTH_YAW_WRONG_WAY_MS) {
+            failure = FAULT_YAW_REFERENCE;
+            cause = FaultCause::YawWrongWay;
             phase = PitchSequencePhase::Fault;
           }
         }
         if (!result.active) {
           failure = FAULT_CONFIG;
+          cause = FaultCause::InvalidOutput;
           phase = PitchSequencePhase::Fault;
         } else if (phase != PitchSequencePhase::Fault &&
-                   !pitch_start::submit_pitch_follow_torque(
+                   !pitch_start::submit_follow_torques(
+                     both && phase == PitchSequencePhase::Tracking ?
+                       result.yaw.control_output * c::FOLLOW_YAW_DIRECTION : 0.0f,
                      result.pitch.control_output * c::HOME_PITCH_DIRECTION, now)) {
           failure = FAULT_FEEDBACK;
+          cause = FaultCause::Feedback;
           phase = PitchSequencePhase::Fault;
         }
       }
     }
+    if (!trace.latched) {
+      trace.stamp_ms = now;
+      trace.fault = failure;
+      trace.cause = cause;
+      trace.yaw_error_rad = result.yaw.target_angle_rad - imu.yaw_rad;
+      trace.yaw_speed_rad_s = c::IMU_YAW_DIRECTION * imu.world_yaw_rate_rad_s;
+      trace.yaw_torque_nm = result.yaw.control_output * c::FOLLOW_YAW_DIRECTION;
+      trace.yaw_motor_travel_rad = reference_started ? motor_sample.angle - yaw_motor_start : 0.0f;
+      trace.yaw_motor_speed_rad_s = motor_sample.speed;
+      trace.yaw_feedback_torque_nm = motor_sample.torque;
+      trace.yaw_imu_travel_rad = reference_started ? imu.yaw_rad - initial.yaw : 0.0f;
+      if (phase == PitchSequencePhase::Fault) {
+        // Freeze BEFORE the fault handler zeros yaw; the 50Hz plot otherwise
+        // misses the offending 1ms event and shows only a released motor.
+        pitch_start::read_can_diagnostics(fault_can);
+        trace.yaw_torque_nm = fault_can.last_yaw_torque_nm;
+        trace.latched = true;
+      }
+    }
+    trace.phase = static_cast<uint8_t>(phase);
     if (phase == PitchSequencePhase::Fault) {
       result.active = false;
+      result.yaw.control_output = 0.0f;
+      if (both) reset_axis(yaw_state);
       result.pitch.control_output = 0.0f;
       // A following error is not an instruction to let a gravity-loaded joint
       // fall. With trustworthy IMU/motor feedback, stop the plan and hold a
       // bounded position. Sensor/bus/timing faults and explicit stop still zero.
-      const bool can_hold = pitch_support_fault(failure) && have_speed && imu.valid &&
-        std::isfinite(imu.pitch_rad) && std::isfinite(speed) && result.feedback_fresh &&
+      const bool can_hold = (pitch_support_fault(failure) ||
+          (yaw_feedback_fault && failure == FAULT_FEEDBACK)) && have_speed && imu.valid &&
+        std::isfinite(imu.pitch_rad) && std::isfinite(speed) && pitch_feedback_fresh &&
         prepared.homed && prepared.m2006_locked && enabled && !rc_stop &&
         elapsed <= c::FOLLOW_MAX_STEP_MS;
       if (can_hold) {
@@ -747,6 +931,7 @@ void run_pitch_sequence()
     result.pitch_sequence_phase = phase;
     taskENTER_CRITICAL();
     latest = result;
+    sequence_diagnostics = trace;
     taskEXIT_CRITICAL();
     if (elapsed > c::FOLLOW_MAX_STEP_MS) wake = now;
   }

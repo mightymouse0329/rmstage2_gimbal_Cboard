@@ -37,8 +37,18 @@ bool selected();
 void start();
 void cancel();
 Status snapshot();
+void snapshot(Status & out);
+struct CanDiagnostics {
+  uint32_t follow_frames, last_tx_ms, max_gap_ms, errors;
+  float last_yaw_torque_nm, last_pitch_torque_nm;
+  // Last missing startup gates, latched on timeout: 1 pitch, 2 M2006, 4 IMU freshness, 8 IMU angle.
+  uint8_t waiting_inputs;
+};
+void read_can_diagnostics(CanDiagnostics & out);
 // Accepted only after successful preparation. Keeps M2006 hold and transfers only GM6020.
 bool submit_pitch_follow_torque(float torque_nm, uint32_t now_ms);
+// One timestamp for both GM6020 commands; yaw remains zero unless both mode is selected.
+bool submit_follow_torques(float yaw_torque_nm, float pitch_torque_nm, uint32_t now_ms);
 bool receive_can1(const CAN_RxHeaderTypeDef &, uint8_t *, uint32_t now_ms);
 void transmit_can1(uint32_t now_ms);
 }

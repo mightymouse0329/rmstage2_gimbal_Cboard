@@ -55,6 +55,7 @@ constexpr uint8_t FAULT_CONFIG = 5;
 constexpr uint8_t FAULT_IMU = 6;
 constexpr uint8_t FAULT_PRELIFT = 7;
 constexpr uint8_t FAULT_BOUNDARY = 8;
+constexpr uint8_t FAULT_YAW_REFERENCE = 9;  // Implausible IMU yaw jump or wrong initial motion.
 enum class PitchSequencePhase : uint8_t { Waiting=0, Prelift=1, Tracking=2, Fault=3 };
 
 struct Result
@@ -70,11 +71,29 @@ struct Result
   bool rc_stop;
   uint8_t fault;  // FAULT_*，停机原因，便于在曲线上定位
   bool pitch_only;
+  bool prepared_sequence;  // pitch_start -> prelift -> one/two-axis IMU tracking.
   PitchSequencePhase pitch_sequence_phase;
   bool pitch_reference_started;
   bool pitch_fault_holding;
   bool pitch_boundary_braking;
 };
+
+enum class FaultCause : uint8_t {
+  None=0, YawTracking=1, PitchTracking=2, YawOverspeed=3, PitchOverspeed=4,
+  YawJump=5, YawWrongWay=6, Feedback=7, Timing=8, Imu=9,
+  Boundary=10, Prelift=11, InvalidOutput=12, Stop=13
+};
+struct SequenceDiagnostics {
+  uint32_t stamp_ms, max_step_ms;
+  uint8_t phase, fault;
+  FaultCause cause;
+  bool latched;
+  float yaw_error_rad, yaw_speed_rad_s, yaw_torque_nm;
+  // Diagnostic CAN feedback only; never used by the IMU control/grading loops.
+  float yaw_motor_travel_rad, yaw_motor_speed_rad_s, yaw_feedback_torque_nm;
+  float yaw_imu_travel_rad;
+};
+void read_sequence_diagnostics(SequenceDiagnostics & out);
 
 // 任务上下文接口。反馈由 CAN1 适配器每周期刷新，set_feedback 保留兼容。
 void set_feedback(const Feedback & feedback);

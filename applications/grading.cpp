@@ -72,7 +72,7 @@ void run()
     score.actual_pitch_rad = imu.valid ? imu.pitch_rad : missing;
     const int32_t sample_offset = static_cast<int32_t>(imu.stamp_ms-state.stamp_ms);
     const int32_t max_offset = control_constants::FOLLOW_MAX_STEP_MS;
-    const bool owner_allows = state.pitch_only ?
+    const bool owner_allows = state.prepared_sequence ?
       state.pitch_sequence_phase == trajectory_follow::PitchSequencePhase::Tracking :
       (!homing::selected() && !pitch_start::selected());
     const bool tracking = imu.valid && owner_allows &&
@@ -83,7 +83,7 @@ void run()
       sample_offset >= -max_offset && sample_offset <= max_offset;
     // The plan remains visible after a latched motion fault. Only scoring is
     // gated by tracking; do not replace the reference with a constant on stop.
-    if (tracking || (state.pitch_only && state.pitch_reference_started)) {
+    if (tracking || (state.prepared_sequence && state.pitch_reference_started)) {
       // Evaluate the SAME plan at the IMU timestamp, avoiding a one-tick
       // phase error between the separate control and grading tasks.
       constexpr uint32_t scale = control_constants::FOLLOW_TRAJECTORY_TIME_SCALE;
@@ -92,7 +92,7 @@ void run()
         sample_offset : 0;
       int32_t phase = static_cast<int32_t>(state.trajectory_elapsed_ms) + aligned_offset;
       if (phase < 0) phase += period_ms;
-      const auto reference = state.pitch_only ?
+      const auto reference = state.prepared_sequence ?
         trajectory_follow::sample_reference(static_cast<uint32_t>(phase % period_ms)) :
         trajectory_sample_at_ms((phase % period_ms) / scale);
       score.target_yaw_rad = reference.yaw;
@@ -100,7 +100,7 @@ void run()
     }
     score.yaw_active = tracking && !state.pitch_only && std::isfinite(imu.yaw_rad) &&
       std::isfinite(state.yaw.target_angle_rad);
-    score.pitch_active = tracking && (state.pitch_only || !control_constants::FOLLOW_SINGLE_YAW) &&
+    score.pitch_active = tracking && (state.prepared_sequence || !control_constants::FOLLOW_SINGLE_YAW) &&
       std::isfinite(imu.pitch_rad) && std::isfinite(state.pitch.target_angle_rad);
 
     if (score.yaw_active) {
