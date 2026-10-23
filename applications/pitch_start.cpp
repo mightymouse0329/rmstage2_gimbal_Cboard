@@ -65,7 +65,7 @@ constexpr float PITCH_START_MIN_IMU_SEEK_RAD = 0.01745329252f;  // 1 degree to l
 // saturation (1.8 Nm in its conversion) as a continuous holding specification.
 constexpr float END_HOLD_MAX_TORQUE_NM = 1.0f;
 constexpr float END_HOLD_KP = 60.0f;  // Nm/rad: displacement resistance.
-constexpr float END_HOLD_KI = 15.0f;  // Nm/(rad*s): slow load learning avoids stiction hunting.
+constexpr float END_HOLD_KI = 18.0f;  // Nm/(rad*s): slow load learning avoids stiction hunting.
 constexpr float END_HOLD_KD =
   0.40f;  // Nm/(rad/s): damping trial; keep position stiffness and torque limit.
 constexpr float END_HOLD_SPEED_FILTER_S = 0.002f;

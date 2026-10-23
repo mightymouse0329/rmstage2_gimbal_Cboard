@@ -150,7 +150,7 @@ struct Controller {
     }
     if (stage==Stage::DescentHold) {
       mt=-c::HOME_M2006_DAMPING_NM_PER_RAD_S*f.ms;
-      if (now-entered>=5000U) { fold_pi={};settling=false;enter(Stage::FoldBack,now); }
+      if (now-entered>=c::INFRARED_AUTO_DESCENT_HOLD_MS) { fold_pi={};settling=false;enter(Stage::FoldBack,now); }
       return;
     }
     if (stage==Stage::FoldBack) {

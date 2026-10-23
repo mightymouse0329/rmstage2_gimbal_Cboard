@@ -9,8 +9,8 @@ namespace control_constants
 // -> dual IMU following for 5s -> weak GM6020 holds; M2006 keeps strong holding.
 // false: every original standalone/one-axis/two-axis test selector works as before.
 constexpr bool INFRARED_PITCH_AUTO_ENABLE = true;
-constexpr float INFRARED_AUTO_TRIGGER_CM = 40.0f;
-constexpr unsigned INFRARED_AUTO_PREPARE_DELAY_MS = 20000U;
+constexpr float INFRARED_AUTO_TRIGGER_CM = 50.0f;
+constexpr unsigned INFRARED_AUTO_PREPARE_DELAY_MS = 43000U;
 constexpr unsigned INFRARED_AUTO_FOLLOW_MS = 10000U;
 constexpr float INFRARED_AUTO_FOLD_ENCODER_RAD = 0.8f;
 // Teammate's actual default-pose parameter is 25 degrees; keep it local to this mode.
@@ -23,6 +23,8 @@ constexpr float INFRARED_AUTO_FOLD_KI = 2.0f;
 constexpr float INFRARED_AUTO_FOLD_KD = 0.30f;
 constexpr float INFRARED_AUTO_FOLD_TOL_RAD = 0.015f;
 constexpr float INFRARED_AUTO_FOLD_QUIET_RAD_S = 0.05f;
+// 折叠到最低点（Descent 结束时）的保持时间。
+constexpr unsigned INFRARED_AUTO_DESCENT_HOLD_MS = 10000U;
 constexpr unsigned INFRARED_AUTO_FOLD_SETTLE_MS = 200U;
 constexpr unsigned INFRARED_AUTO_FOLD_TIMEOUT_MS = 15000U;
 constexpr float INFRARED_AUTO_WEAK_YAW_KP = 3.0f;
