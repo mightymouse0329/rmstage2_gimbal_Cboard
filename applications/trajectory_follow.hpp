@@ -56,7 +56,7 @@ constexpr uint8_t FAULT_IMU = 6;
 constexpr uint8_t FAULT_PRELIFT = 7;
 constexpr uint8_t FAULT_BOUNDARY = 8;
 constexpr uint8_t FAULT_YAW_REFERENCE = 9;  // Implausible IMU yaw jump or wrong initial motion.
-enum class PitchSequencePhase : uint8_t { Waiting=0, Prelift=1, Tracking=2, Fault=3 };
+enum class PitchSequencePhase : uint8_t { Waiting=0, Prelift=1, Tracking=2, Fault=3, Holding=4 };
 
 struct Result
 {

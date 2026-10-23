@@ -5,13 +5,47 @@ namespace control_constants
 {
 // Standalone motor-test switches. Tracking selectors below can request their
 // own preparation; homing remains exclusive. No test auto-starts another test.
+// true: IR homing -> encoder 0.8rad hold -> IR age >=20s -> existing pitch_start
+// -> dual IMU following for 5s -> weak GM6020 holds; M2006 keeps strong holding.
+// false: every original standalone/one-axis/two-axis test selector works as before.
+constexpr bool INFRARED_PITCH_AUTO_ENABLE = true;
+constexpr float INFRARED_AUTO_TRIGGER_CM = 40.0f;
+constexpr unsigned INFRARED_AUTO_PREPARE_DELAY_MS = 20000U;
+constexpr unsigned INFRARED_AUTO_FOLLOW_MS = 10000U;
+constexpr float INFRARED_AUTO_FOLD_ENCODER_RAD = 0.8f;
+// Teammate's actual default-pose parameter is 25 degrees; keep it local to this mode.
+constexpr float INFRARED_AUTO_DEFAULT_TRAVEL_RAD = 0.4363323130f;
+constexpr float INFRARED_AUTO_YAW_HOLD_KP = 12.6f;  // Teammate: 70 * 0.18 Nm/rad.
+constexpr float INFRARED_AUTO_YAW_HOLD_KD = 0.18f;
+constexpr float INFRARED_AUTO_YAW_HOLD_MAX_NM = 0.95f;
+constexpr float INFRARED_AUTO_FOLD_KP = 10.0f;
+constexpr float INFRARED_AUTO_FOLD_KI = 2.0f;
+constexpr float INFRARED_AUTO_FOLD_KD = 0.30f;
+constexpr float INFRARED_AUTO_FOLD_TOL_RAD = 0.015f;
+constexpr float INFRARED_AUTO_FOLD_QUIET_RAD_S = 0.05f;
+constexpr unsigned INFRARED_AUTO_FOLD_SETTLE_MS = 200U;
+constexpr unsigned INFRARED_AUTO_FOLD_TIMEOUT_MS = 15000U;
+constexpr float INFRARED_AUTO_WEAK_YAW_KP = 3.0f;
+constexpr float INFRARED_AUTO_WEAK_YAW_KD = 0.15f;
+constexpr float INFRARED_AUTO_WEAK_YAW_MAX_NM = 0.35f;
+constexpr float INFRARED_AUTO_WEAK_PITCH_KP = 3.0f;
+constexpr float INFRARED_AUTO_WEAK_PITCH_KD = 0.15f;
+constexpr float INFRARED_AUTO_WEAK_PITCH_MAX_NM = 0.35f;
+static_assert(
+  INFRARED_AUTO_PREPARE_DELAY_MS > 0U && INFRARED_AUTO_FOLLOW_MS > 0U &&
+    INFRARED_AUTO_FOLD_SETTLE_MS > 0U &&
+    INFRARED_AUTO_FOLD_TIMEOUT_MS > INFRARED_AUTO_FOLD_SETTLE_MS &&
+    INFRARED_AUTO_FOLD_ENCODER_RAD > 0.0f && INFRARED_AUTO_TRIGGER_CM > 0.0f &&
+    INFRARED_AUTO_FOLD_KP > 0.0f && INFRARED_AUTO_FOLD_KI >= 0.0f && INFRARED_AUTO_FOLD_KD > 0.0f,
+  "Invalid IR automatic sequence settings");
 constexpr bool HOMING_ENABLED = false;
 constexpr bool PITCH_START_ENABLED = false;
 // Highest tracking priority: prepare pitch_start, prelift, then start both axes.
 // false preserves pitch-only/yaw-only selections below.
 constexpr bool FOLLOW_BOTH_ENABLE = true;
+constexpr bool FOLLOW_BOTH_ACTIVE = INFRARED_PITCH_AUTO_ENABLE || FOLLOW_BOTH_ENABLE;
 static_assert(
-  !(HOMING_ENABLED && (PITCH_START_ENABLED || FOLLOW_BOTH_ENABLE)),
+  INFRARED_PITCH_AUTO_ENABLE || !(HOMING_ENABLED && (PITCH_START_ENABLED || FOLLOW_BOTH_ENABLE)),
   "Enable only one motor test: HOMING_ENABLED or PITCH_START_ENABLED (shared motors/CAN frames)");
 
 // BMI088 on the moving gimbal C-board. All angles/rates are radians.
@@ -191,6 +225,14 @@ constexpr float HOME_M2006_HOLD_DEADBAND_RAD =
 constexpr float HOME_M2006_SPEED_KI = 0.40f;
 constexpr float HOME_M2006_MAX_TORQUE_NM =
   1.00f;  // M2006 output-shaft hardware maximum  // M2006 axis max: the gearbox can also hold the pitch  // allow the M2006 path up to 1.2 Nm on the axis // HOLD only, never used during return.
+static_assert(
+  !INFRARED_PITCH_AUTO_ENABLE ||
+    (INFRARED_AUTO_FOLD_ENCODER_RAD < HOME_M2006_PULLBACK_RAD && INFRARED_AUTO_WEAK_YAW_KP > 0.0f &&
+     INFRARED_AUTO_WEAK_YAW_KD >= 0.0f && INFRARED_AUTO_WEAK_PITCH_KP > 0.0f &&
+     INFRARED_AUTO_WEAK_PITCH_KD >= 0.0f && INFRARED_AUTO_WEAK_YAW_MAX_NM > 0.0f &&
+     INFRARED_AUTO_WEAK_YAW_MAX_NM <= 2.223f && INFRARED_AUTO_WEAK_PITCH_MAX_NM > 0.0f &&
+     INFRARED_AUTO_WEAK_PITCH_MAX_NM <= 2.223f),
+  "Invalid IR return target or weak-hold configuration");
 constexpr float HOME_M2006_MAX_SPEED_RAD_S = 0.35f;  // reverted  // M2006 axis speed: 0.35 -> 0.80
 constexpr float HOME_M2006_SETTLE_SPEED_RAD_S = 0.05f;
 // Append torque diagnostics to the existing six homing plot channels.
@@ -369,10 +411,11 @@ constexpr bool FOLLOW_AFTER_PITCH_START = true;
 // A tracking selector can request its own preparation even if the standalone
 // PITCH_START_ENABLED test switch is false. Homing remains an exclusive test.
 constexpr bool PITCH_START_SELECTED =
-  !HOMING_ENABLED &&
-  (FOLLOW_BOTH_ENABLE || (!FOLLOW_SINGLE_YAW && (PITCH_START_ENABLED || FOLLOW_AFTER_PITCH_START)));
+  INFRARED_PITCH_AUTO_ENABLE ||
+  (!HOMING_ENABLED && (FOLLOW_BOTH_ENABLE ||
+                       (!FOLLOW_SINGLE_YAW && (PITCH_START_ENABLED || FOLLOW_AFTER_PITCH_START))));
 constexpr bool FOLLOW_PITCH_SEQUENCE_ENABLED =
-  PITCH_START_SELECTED && (FOLLOW_BOTH_ENABLE || FOLLOW_AFTER_PITCH_START);
+  PITCH_START_SELECTED && (FOLLOW_BOTH_ACTIVE || FOLLOW_AFTER_PITCH_START);
 // Dual yaw handoff: wait for a quiet axis, clear history, then ramp authority.
 constexpr unsigned FOLLOW_BOTH_YAW_STARTUP_MS = 150U;
 constexpr bool FOLLOW_BOTH_RUNTIME_DIAGNOSTICS =

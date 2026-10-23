@@ -4,6 +4,7 @@
 #include "task.h"
 #include "can.h"
 #include "homing.hpp"
+#include "infrared_pitch_auto.hpp"
 #include "pitch_start.hpp"
 #include "trajectory_follow.hpp"
 
@@ -54,6 +55,7 @@ extern "C" void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef* hcan) {
     if (HAL_CAN_GetRxMessage(hcan,CAN_RX_FIFO0,&header,data)!=HAL_OK) break;
     if (header.IDE!=CAN_ID_STD || header.RTR!=CAN_RTR_DATA || header.DLC!=8) continue;
     const uint32_t now=xTaskGetTickCountFromISR();
+    infrared_pitch_auto::receive_can1(header,data,now);  // Observer; never consumes legacy feedback.
     if (homing::receive_can1(header,data,now)) continue;
     if (pitch_start::receive_can1(header,data,now)) continue;
     trajectory_follow::receive_can1(header,data,now);

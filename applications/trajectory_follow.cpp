@@ -1,4 +1,5 @@
 #include "trajectory_follow.hpp"
+#include "infrared_pitch_auto.hpp"
 #include "homing.hpp"
 #include "pitch_start.hpp"
 #include "gimbal_can.hpp"
@@ -535,7 +536,7 @@ constexpr bool dual_yaw_wrong_way(float plan_delta, float actual_delta, float sp
 void run_pitch_sequence()
 {
   namespace c = control_constants;
-  constexpr bool both = c::FOLLOW_BOTH_ENABLE;
+  constexpr bool both = c::FOLLOW_BOTH_ACTIVE;
   static Result result;  // Keep the existing 256-word task stack; no large reset temporary.
   static pitch_start::Status prepared;
   static gimbal_imu::State imu;
@@ -658,7 +659,7 @@ void run_pitch_sequence()
       }
     }
 
-    if (phase == PitchSequencePhase::Prelift || phase == PitchSequencePhase::Tracking) {
+    if (phase == PitchSequencePhase::Prelift || phase == PitchSequencePhase::Tracking || phase == PitchSequencePhase::Holding) {
       if (!imu.valid || !std::isfinite(imu.pitch_rad) || !std::isfinite(imu.raw_pitch_rad) ||
           (both && (!std::isfinite(imu.yaw_rad) || !std::isfinite(imu.raw_yaw_rad)))) {
         failure = FAULT_IMU;
@@ -692,7 +693,7 @@ void run_pitch_sequence()
         if (both) {
           const float yaw_delta = imu.raw_yaw_rad - previous_raw_yaw;
           if (!std::isfinite(imu.world_yaw_rate_rad_s) || !dual_yaw_step_valid(yaw_delta,sensor_dt)) {
-            if (phase == PitchSequencePhase::Prelift || phase == PitchSequencePhase::Tracking) {
+            if (phase == PitchSequencePhase::Prelift || phase == PitchSequencePhase::Tracking || phase == PitchSequencePhase::Holding) {
               failure = FAULT_YAW_REFERENCE;
               cause = FaultCause::YawJump;
               phase = PitchSequencePhase::Fault;
@@ -716,22 +717,22 @@ void run_pitch_sequence()
     }
     const float speed = up_sign * filtered_raw_speed;
     float yaw_speed = c::IMU_YAW_DIRECTION * filtered_raw_yaw_speed;
-    const float speed_limit = phase == PitchSequencePhase::Tracking ?
+    const float speed_limit = (phase == PitchSequencePhase::Tracking || phase == PitchSequencePhase::Holding) ?
       c::FOLLOW_PITCH.max_speed_rad_s : c::FOLLOW_PITCH_PRELIFT_MAX_SPEED_RAD_S;
-    if ((phase == PitchSequencePhase::Prelift || phase == PitchSequencePhase::Tracking) &&
+    if ((phase == PitchSequencePhase::Prelift || phase == PitchSequencePhase::Tracking || phase == PitchSequencePhase::Holding) &&
         std::fabs(speed) > speed_limit * c::FOLLOW_OVERSPEED_FACTOR) {
       failure = FAULT_OVERSPEED;
       cause = FaultCause::PitchOverspeed;
       phase = PitchSequencePhase::Fault;
     }
-    if (both && phase == PitchSequencePhase::Tracking &&
+    if (both && (phase == PitchSequencePhase::Tracking || phase == PitchSequencePhase::Holding) &&
         std::fabs(yaw_speed) > c::FOLLOW_YAW.max_speed_rad_s * c::FOLLOW_OVERSPEED_FACTOR) {
       failure = FAULT_OVERSPEED;
       cause = FaultCause::YawOverspeed;
       phase = PitchSequencePhase::Fault;
     }
 
-    if (phase == PitchSequencePhase::Prelift || phase == PitchSequencePhase::Tracking) {
+    if (phase == PitchSequencePhase::Prelift || phase == PitchSequencePhase::Tracking || phase == PitchSequencePhase::Holding) {
       TrajectoryPoint target = initial;
       if (phase == PitchSequencePhase::Prelift) {
         const float seconds = c::FOLLOW_PITCH_PRELIFT_TIME_MS * 0.001f;
@@ -790,7 +791,33 @@ void run_pitch_sequence()
         result.trajectory_elapsed_ms = (now - trajectory_start) % period;
         target = sample_reference(result.trajectory_elapsed_ms);
       }
-      if (phase != PitchSequencePhase::Fault) {
+      if (phase == PitchSequencePhase::Tracking && infrared_pitch_auto::follow_stop_due(now))
+        phase = PitchSequencePhase::Holding;
+      if (phase == PitchSequencePhase::Holding) {
+        const auto hold = infrared_pitch_auto::hold_follow_pose(imu.yaw_rad,imu.pitch_rad,yaw_speed,speed);
+        result.yaw.target_angle_rad = result.yaw.limited_angle_rad = hold.yaw_target_rad;
+        result.pitch.target_angle_rad = result.pitch.limited_angle_rad = hold.pitch_target_rad;
+        result.yaw.angle_error_rad = hold.yaw_target_rad-imu.yaw_rad;
+        result.pitch.angle_error_rad = hold.pitch_target_rad-imu.pitch_rad;
+        result.yaw.actual_angle_rad = imu.yaw_rad;
+        result.pitch.actual_angle_rad = imu.pitch_rad;
+        result.yaw.actual_speed_rad_s = yaw_speed;
+        result.pitch.actual_speed_rad_s = speed;
+        result.yaw.control_output = hold.yaw_torque_nm;
+        // Existing physical pitch boundary brake keeps priority over weak holding.
+        const auto boundary = pitch_boundary_torque(imu.pitch_rad,speed,
+          hold.pitch_torque_nm,tracking_lower,pitch_config.angle_max_rad);
+        result.pitch.control_output = boundary.torque;
+        result.pitch_boundary_braking = boundary.lower_braking || boundary.upper_braking;
+        result.active = finite_output(result.yaw) && finite_output(result.pitch);
+        if (!result.active || !pitch_start::submit_follow_torques(
+              result.yaw.control_output*c::FOLLOW_YAW_DIRECTION,
+              result.pitch.control_output*c::HOME_PITCH_DIRECTION,now)) {
+          failure = result.active ? FAULT_FEEDBACK : FAULT_CONFIG;
+          cause = result.active ? FaultCause::Feedback : FaultCause::InvalidOutput;
+          phase = PitchSequencePhase::Fault;
+        }
+      } else if (phase != PitchSequencePhase::Fault) {
         // After prelift, preserve clearance below the trajectory minimum rather
         // than using a soft bound only one degree above the physical stop.
         pitch_config.angle_min_rad = phase == PitchSequencePhase::Tracking ?
@@ -926,7 +953,9 @@ void run_pitch_sequence()
         (void)pitch_start::submit_pitch_follow_torque(0.0f, now);
       }
     }
-    result.pitch_reference_started = reference_started;
+    if (phase == PitchSequencePhase::Fault && infrared_pitch_auto::selected())
+      infrared_pitch_auto::report_follow_fault();
+    result.pitch_reference_started = reference_started && phase != PitchSequencePhase::Holding;
     result.fault = failure;
     result.pitch_sequence_phase = phase;
     taskENTER_CRITICAL();

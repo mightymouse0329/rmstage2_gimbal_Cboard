@@ -18,6 +18,8 @@ struct Status
   uint16_t raw_distance;
   uint8_t payload_byte2;
   uint8_t payload_byte3;
+  bool timer_started;
+  uint32_t trigger_stamp_ms;
 };
 Status snapshot();
 }  // namespace infrared

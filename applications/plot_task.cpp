@@ -6,6 +6,7 @@
 #include "grading.hpp"
 #include "gimbal_imu.hpp"
 #include "homing.hpp"
+#include "infrared_pitch_auto.hpp"
 #include "pitch_start.hpp"
 #include "infrared_status.hpp"
 #include "io/plotter/plotter.hpp"
@@ -31,7 +32,32 @@ extern "C" void plot_task()
   uint32_t last_wake = osKernelSysTick();
   for (;;) {
     osDelayUntil(&last_wake, 20);
-    if (control_constants::FOLLOW_BOTH_ENABLE) {
+    if (infrared_pitch_auto::selected()) {
+      const auto score = grading::read();
+      static infrared_pitch_auto::Status automatic;
+      static pitch_start::Status preparation;
+      static trajectory_follow::SequenceDiagnostics tracking;
+      infrared_pitch_auto::snapshot(automatic);
+      pitch_start::snapshot(preparation);
+      trajectory_follow::read_sequence_diagnostics(tracking);
+      // 1..6 unchanged: yaw target/actual deg, pitch target/actual deg, two scores.
+      // 7 phase, 8 fault, 9 cm, 10 IR age(s), 11/12 M2006 encoder travel/0.8 goal(rad),
+      // 13/14 M2006 command/feedback(Nm), 15 pitch_start stage, 16 follow phase,
+      // 17 actual tracking age(s), 18 IMU calibration progress.
+      // On automatic overspeed fault only: 16 fault-origin phase, 17 pitch speed,
+      // 18 M2006 speed (both rad/s), latched BEFORE stopping.
+      const bool automatic_overspeed=automatic.stage==infrared_pitch_auto::Stage::Fault &&
+        automatic.fault==infrared_pitch_auto::Fault::Overspeed;
+      plotter.plot(score.target_yaw_rad*kRadToDeg,score.actual_yaw_rad*kRadToDeg,
+        score.target_pitch_rad*kRadToDeg,score.actual_pitch_rad*kRadToDeg,
+        score.yaw_ratio,score.pitch_ratio,static_cast<float>(automatic.stage),
+        static_cast<float>(automatic.fault),automatic.distance_cm,automatic.infrared_elapsed_ms*.001f,
+        automatic.m2006_relative_rad,automatic.m2006_target_rad,automatic.m2006_torque_nm,
+        automatic.m2006_feedback_nm,static_cast<float>(preparation.stage),
+        automatic_overspeed ? static_cast<float>(automatic.fault_stage) : static_cast<float>(tracking.phase),
+        automatic_overspeed ? automatic.fault_pitch_speed_rad_s : automatic.tracking_elapsed_ms*.001f,
+        automatic_overspeed ? automatic.fault_m2006_speed_rad_s : automatic.calibration_progress);
+    } else if (control_constants::FOLLOW_BOTH_ENABLE) {
       const auto score = grading::read();
       // First six channels share one trajectory phase; optional diagnostics follow.
       if (control_constants::FOLLOW_BOTH_RUNTIME_DIAGNOSTICS) {

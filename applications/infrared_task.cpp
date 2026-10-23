@@ -14,6 +14,8 @@ uint32_t last_byte_ms = 0, last_frame_ms = 0;
 uint32_t byte_count = 0, frame_count = 0, checksum_errors = 0, uart_errors = 0;
 float distance_cm = 0.0f;
 bool have_frame = false;
+bool timer_started = false;
+uint32_t timer_start_ms = 0;
 uint32_t current_baud = control_constants::INFRARED_UART_BAUD;
 uint8_t last_payload_length = 0;
 uint16_t last_raw_distance = 0;
@@ -63,6 +65,11 @@ void consume(uint8_t byte, uint32_t now)
     g_data.distance_cm = have_frame ? static_cast<uint16_t>(distance_cm) : 0U;
     g_data.infrared_last_rx_ms = now;  // Last checksum-correct frame, not arbitrary byte.
     g_data.infrared_valid = have_frame ? 1U : 0U;
+    // Timestamp the FIRST valid near reading, never arbitrary bytes or invalid ranges.
+    if (have_frame && !timer_started && distance_cm <= control_constants::INFRARED_AUTO_TRIGGER_CM) {
+      timer_started = true;
+      timer_start_ms = now;
+    }
   }
   else ++checksum_errors;
   used = 0;
@@ -77,7 +84,7 @@ Status snapshot()
     have_frame && (osKernelSysTick() - last_frame_ms <
                   control_constants::INFRARED_VALID_TIMEOUT_MS),
     current_baud, last_payload_length, {}, recent_write_index,
-    last_raw_distance, last_payload_byte2, last_payload_byte3};
+    last_raw_distance, last_payload_byte2, last_payload_byte3,timer_started,timer_start_ms};
   for (unsigned i = 0; i < 16U; ++i) result.recent_bytes[i] = recent_bytes[i];
   taskEXIT_CRITICAL();
   return result;
@@ -87,6 +94,9 @@ Status snapshot()
 extern "C" void infrared_task()
 {
   g_data.infrared_valid = 0;
+  g_data.infrared_timer_ms = 0;
+  timer_started = false;
+  timer_start_ms = 0;
   // USART6 is dedicated to the sensor; USART1 plot baud remains unchanged.
   HAL_UART_AbortReceive(&huart6);
   huart6.Init.BaudRate = control_constants::INFRARED_UART_BAUD;
@@ -119,6 +129,7 @@ extern "C" void infrared_task()
     if (!have_frame || osKernelSysTick() - last_frame_ms >=
                        control_constants::INFRARED_VALID_TIMEOUT_MS)
       g_data.infrared_valid = 0;
+    if (timer_started) g_data.infrared_timer_ms = osKernelSysTick() - timer_start_ms;
     // Existing HAL error callback belongs to rc_task; recover USART6 here.
     if (huart6.ErrorCode != HAL_UART_ERROR_NONE) {
       ++uart_errors;

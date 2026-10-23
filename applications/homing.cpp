@@ -1,4 +1,5 @@
 #include "homing.hpp"
+#include "infrared_pitch_auto.hpp"
 #include "gimbal_can.hpp"
 #include <cmath>
 #include "FreeRTOS.h"
@@ -410,7 +411,7 @@ bool submit(uint32_t id,uint8_t * data) {
 }
 } // namespace
 // Standalone selection; completion never schedules another motor program.
-bool selected() {return c::HOMING_ENABLED;}
+bool selected() {return c::HOMING_ENABLED && !infrared_pitch_auto::selected();}
 void start() {taskENTER_CRITICAL();start_requested=true;stop_requested=false;taskEXIT_CRITICAL();}
 void cancel() {taskENTER_CRITICAL();finished=false;stop_requested=true;start_requested=false;
   pitch_request=m_request=0.0f;taskEXIT_CRITICAL();}
@@ -475,6 +476,10 @@ void run() {
 } // namespace homing
 extern "C" void homing_task(void const * argument) {
   (void)argument;
+  if (infrared_pitch_auto::selected()) {
+    while (!gimbal_can::start()) vTaskDelay(pdMS_TO_TICKS(100));
+    infrared_pitch_auto::run();
+  }
   if (homing::selected()) {
     while (!gimbal_can::start()) vTaskDelay(pdMS_TO_TICKS(100));
     homing::run();

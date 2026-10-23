@@ -16,6 +16,7 @@ struct SharedData
   uint16_t distance_cm;
   uint8_t infrared_valid;
   uint32_t infrared_last_rx_ms;
+  uint32_t infrared_timer_ms;  // Elapsed from first valid <=40cm event; never reset by distance/loss.
 
   // 自主任务
   uint8_t auto_state;    // 见 AutoState 枚举

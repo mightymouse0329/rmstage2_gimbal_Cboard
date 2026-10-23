@@ -6,6 +6,7 @@
 #include "control_constants.hpp"
 #include "gimbal_can.hpp"
 #include "gimbal_imu.hpp"
+#include "infrared_pitch_auto.hpp"
 #include "motor/rm_motor/rm_motor.hpp"
 #include "task.h"
 #include "trajectory_follow.hpp"
@@ -19,7 +20,7 @@ namespace
 namespace c = control_constants;
 static_assert(configTICK_RATE_HZ == 1000, "Homing requires 1ms ticks");
 static_assert(
-  !c::FOLLOW_BOTH_ENABLE ||
+  !c::FOLLOW_BOTH_ACTIVE ||
     (c::HOME_PITCH_ID == c::FOLLOW_PITCH_MOTOR_ID && c::HOME_PITCH_RATIO == c::FOLLOW_PITCH_RATIO),
   "Dual tracking must use the same pitch motor and ratio as preparation");
 sp::RM_Motor pitch(c::HOME_PITCH_ID, sp::RM_Motors::GM6020, c::HOME_PITCH_RATIO);
@@ -37,7 +38,8 @@ float follow_pitch_torque = 0.0f;
 float follow_yaw_torque = 0.0f;
 uint32_t follow_pitch_stamp = 0, last_m_tx = 0;
 bool m_sent_once = false;
-bool sent_once = false, start_requested = c::PITCH_START_SELECTED, stop_requested = false;
+bool sent_once = false, start_requested = c::PITCH_START_SELECTED && !c::INFRARED_PITCH_AUTO_ENABLE,
+     stop_requested = false;
 float clamp(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 struct PI
 {
@@ -54,7 +56,7 @@ struct PI
 };
 // Physical mechanism travel is measured by the IMU attached to the moving arm.
 // One M2006-driven lift to the selected IMU travel, then persistent endpoint hold.
-constexpr float PITCH_START_BODY_TRAVEL_RAD = 1.1f;
+constexpr float PITCH_START_BODY_TRAVEL_RAD = 1.2f;
 constexpr uint32_t PITCH_START_IMU_READY_TIMEOUT_MS = 30000U;
 constexpr float PITCH_START_MIN_IMU_SEEK_RAD = 0.01745329252f;  // 1 degree to learn direction.
 
@@ -65,7 +67,7 @@ constexpr float END_HOLD_MAX_TORQUE_NM = 1.0f;
 constexpr float END_HOLD_KP = 60.0f;  // Nm/rad: displacement resistance.
 constexpr float END_HOLD_KI = 15.0f;  // Nm/(rad*s): slow load learning avoids stiction hunting.
 constexpr float END_HOLD_KD =
-  0.42f;  // Nm/(rad/s): damping trial; keep position stiffness and torque limit.
+  0.40f;  // Nm/(rad/s): damping trial; keep position stiffness and torque limit.
 constexpr float END_HOLD_SPEED_FILTER_S = 0.002f;
 // MOTOR OUTPUT-SHAFT tolerance, not the IMU body angle (~0.086 degree).
 constexpr float END_HOLD_POSITION_TOL_RAD = 0.0015f;
@@ -439,7 +441,7 @@ bool send_gm_frame(float yaw_torque, float pitch_torque, uint32_t now, bool foll
   uint8_t data[8] = {};
   pitch.cmd(pitch_torque);
   pitch.write(data);
-  if (c::FOLLOW_BOTH_ENABLE) {
+  if (c::FOLLOW_BOTH_ACTIVE) {
     yaw.cmd(yaw_torque);
     yaw.write(data);
   }
@@ -453,7 +455,7 @@ bool send_gm_frame(float yaw_torque, float pitch_torque, uint32_t now, bool foll
       ++can_diagnostics.follow_frames;
     }
     can_diagnostics.last_tx_ms = now;
-    can_diagnostics.last_yaw_torque_nm = c::FOLLOW_BOTH_ENABLE ? yaw_torque : 0.0f;
+    can_diagnostics.last_yaw_torque_nm = c::FOLLOW_BOTH_ACTIVE ? yaw_torque : 0.0f;
     can_diagnostics.last_pitch_torque_nm = pitch_torque;
     last_tx = now;
     sent_once = true;
@@ -515,8 +517,9 @@ bool submit_pitch_follow_torque(float torque_nm, uint32_t now_ms)
 bool submit_follow_torques(float yaw_torque_nm, float pitch_torque_nm, uint32_t now_ms)
 {
   if (
-    !c::FOLLOW_PITCH_SEQUENCE_ENABLED || !selected() || !std::isfinite(yaw_torque_nm) ||
-    !std::isfinite(pitch_torque_nm) || (!c::FOLLOW_BOTH_ENABLE && yaw_torque_nm != 0.0f))
+    !c::FOLLOW_PITCH_SEQUENCE_ENABLED || !selected() ||
+    !infrared_pitch_auto::preparation_active() || !std::isfinite(yaw_torque_nm) ||
+    !std::isfinite(pitch_torque_nm) || (!c::FOLLOW_BOTH_ACTIVE && yaw_torque_nm != 0.0f))
     return false;
   taskENTER_CRITICAL();
   const uint32_t submitted_at = xTaskGetTickCount();
@@ -530,7 +533,7 @@ bool submit_follow_torques(float yaw_torque_nm, float pitch_torque_nm, uint32_t 
     follow_pitch_torque =
       clamp(pitch_torque_nm, -c::FOLLOW_PITCH_MAX_TORQUE_NM, c::FOLLOW_PITCH_MAX_TORQUE_NM);
     follow_yaw_torque =
-      c::FOLLOW_BOTH_ENABLE
+      c::FOLLOW_BOTH_ACTIVE
         ? clamp(yaw_torque_nm, -c::FOLLOW_YAW_MAX_TORQUE_NM, c::FOLLOW_YAW_MAX_TORQUE_NM)
         : 0.0f;
     follow_pitch_stamp = now_ms;
@@ -564,7 +567,7 @@ bool receive_can1(const CAN_RxHeaderTypeDef & h, uint8_t * data, uint32_t now)
 }
 void transmit_can1(uint32_t now)
 {
-  if (!selected()) return;
+  if (!selected() || !infrared_pitch_auto::preparation_active()) return;
   taskENTER_CRITICAL();
   now = xTaskGetTickCount();
   const bool fast_pitch = c::FOLLOW_PITCH_SEQUENCE_ENABLED && follow_pitch_claimed;
@@ -607,6 +610,9 @@ void run()
       continue;
     }
     previous = now;
+    // In automatic mode the existing task receives CAN continuously, but cannot
+    // compute or send motor commands before the one-way ownership handoff.
+    if (!infrared_pitch_auto::preparation_active()) continue;
     const auto imu = gimbal_imu::read();  // Snapshot only; grading task owns SPI/update.
     taskENTER_CRITICAL();
     const uint32_t feedback_now = xTaskGetTickCount();

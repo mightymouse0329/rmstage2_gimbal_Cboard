@@ -127,7 +127,7 @@ void update() {
         work.bias_rad_s[i]=gyro_sum[i]/work.calibration_samples;
         a[i]=acc_sum[i]/work.calibration_samples;
       }
-      if (!attitude.begin(a,c::FOLLOW_BOTH_ENABLE && c::IMU_GIMBAL_AXIS_PROJECTION)) {
+      if (!attitude.begin(a,c::FOLLOW_BOTH_ACTIVE && c::IMU_GIMBAL_AXIS_PROJECTION)) {
         fail(Fault::Range);return;
       }
       work.raw_yaw_rad=attitude.yaw; work.raw_pitch_rad=attitude.pitch;
